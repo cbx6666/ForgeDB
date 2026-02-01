@@ -47,7 +47,7 @@ func (s *SkipList) Search(key string) (types.Entry, bool) {
 	return types.Entry{}, false
 }
 
-func (s *SkipList) Update(key string, entry types.Entry) {
+func (s *SkipList) Upsert(key string, entry types.Entry) {
 	prev := s.head
 	cur := prev.forward[0]
 
@@ -58,6 +58,7 @@ func (s *SkipList) Update(key string, entry types.Entry) {
 
 	if cur != nil && cur.key == key {
 		cur.entry = entry
+		return
 	}
 
 	newNode := &node{
@@ -69,4 +70,18 @@ func (s *SkipList) Update(key string, entry types.Entry) {
 	prev.forward[0] = newNode
 }
 
+func (s *SkipList) First() *node {
+	return s.head.forward[0]
+}
 
+// 返回第一个 key >= target 的节点
+func (s *SkipList) FirstGE(target string) *node {
+	x := s.head
+
+	for i := s.level - 1; i >= 0; i-- {
+		for x.forward[i] != nil && x.forward[i].key < target {
+			x = x.forward[i]
+		}
+	}
+	return x.forward[0]
+}
