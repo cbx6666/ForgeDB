@@ -1,6 +1,11 @@
 package memtable
 
-import "monolithdb/internal/types"
+import (
+	"math/rand"
+	"time"
+
+	"monolithdb/internal/types"
+)
 
 const (
 	maxLevel = 16
@@ -18,6 +23,7 @@ type node struct {
 type SkipList struct {
 	head  *node
 	level int
+	rnd   *rand.Rand
 }
 
 func NewSkipList() *SkipList {
@@ -27,7 +33,17 @@ func NewSkipList() *SkipList {
 	return &SkipList{
 		head:  h,
 		level: 1,
+		rnd:   rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
+}
+
+func (s *SkipList) randomLevel() int {
+	lvl := 1
+	for lvl < maxLevel && s.rnd.Intn(2) == 0 {
+		lvl++
+	}
+
+	return lvl
 }
 
 func (s *SkipList) Search(key string) (types.Entry, bool) {
@@ -48,26 +64,44 @@ func (s *SkipList) Search(key string) (types.Entry, bool) {
 }
 
 func (s *SkipList) Upsert(key string, entry types.Entry) {
-	prev := s.head
-	cur := prev.forward[0]
+	update := make([]*node, maxLevel)
 
-	for cur != nil && cur.key < key {
-		prev = cur
-		cur = cur.forward[0]
+	x := s.head
+	// 找到每层的前驱
+	for i := s.level - 1; i >= 0; i-- {
+		for x.forward[i] != nil && x.forward[i].key < key {
+			x = x.forward[i]
+		}
+		update[i] = x
 	}
 
-	if cur != nil && cur.key == key {
-		cur.entry = entry
+	// 检查 level0 的下一个是不是目标 key
+	x = x.forward[0]
+	if x != nil && x.key == key {
+		x.entry = entry
 		return
+	}
+
+	// 生成新节点层高，通过随机使高层节点稀疏
+	lvl := s.randomLevel()
+
+	if lvl > s.level {
+		for i := s.level; i < lvl; i++ {
+			update[i] = s.head
+		}
+		s.level = lvl
 	}
 
 	newNode := &node{
 		key:     key,
 		entry:   entry,
-		forward: make([]*node, 1),
+		forward: make([]*node, lvl),
 	}
-	newNode.forward[0] = cur
-	prev.forward[0] = newNode
+
+	for i := 0; i < lvl; i++ {
+		newNode.forward[i] = update[i].forward[i]
+		update[i].forward[i] = newNode
+	}
 }
 
 func (s *SkipList) First() *node {
