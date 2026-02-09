@@ -24,39 +24,39 @@ func TestSSTableWriteAndGet(t *testing.T) {
 	}
 
 	// a 命中
-	v, ok, err := Get(path, "a")
+	v, res, err := Get(path, "a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ok || !bytes.Equal(v, []byte("1")) {
-		t.Fatalf("expected a=1, got ok=%v v=%q", ok, v)
+	if res != Found || !bytes.Equal(v, []byte("1")) {
+		t.Fatalf("expected a=1 Found, got res=%v v=%q", res, v)
 	}
 
 	// b 命中
-	v, ok, err = Get(path, "b")
+	v, res, err = Get(path, "b")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ok || !bytes.Equal(v, []byte("hello")) {
-		t.Fatalf("expected b=hello, got ok=%v v=%q", ok, v)
+	if res != Found || !bytes.Equal(v, []byte("hello")) {
+		t.Fatalf("expected b=hello Found, got res=%v v=%q", res, v)
 	}
 
-	// c 是 tombstone，应该不存在
-	v, ok, err = Get(path, "c")
+	// c 是 tombstone
+	v, res, err = Get(path, "c")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok || v != nil {
-		t.Fatalf("expected c to be deleted, got ok=%v v=%v", ok, v)
+	if res != Deleted || v != nil {
+		t.Fatalf("expected c to be Deleted with nil value, got res=%v v=%v", res, v)
 	}
 
 	// 不存在的 key
-	v, ok, err = Get(path, "z")
+	v, res, err = Get(path, "z")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok || v != nil {
-		t.Fatalf("expected z to be not found, got ok=%v v=%v", ok, v)
+	if res != NotFound || v != nil {
+		t.Fatalf("expected z to be NotFound with nil value, got res=%v v=%v", res, v)
 	}
 }
 

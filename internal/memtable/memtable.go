@@ -86,7 +86,7 @@ func (m *MemTable) RangeAll(start, end string) []types.Entry {
 		out = append(out, types.Entry{
 			Key:       n.key,
 			Value:     cloneBytes(n.entry.Value),
-			Tombstone: false,
+			Tombstone: n.entry.Tombstone,
 		})
 
 		n = n.forward[0]

@@ -104,12 +104,17 @@ func (d *DB) Get(key string) ([]byte, bool) {
 
 	// 2) SSTables (newest -> oldest)
 	for _, p := range d.sstables {
-		v, ok, err := sstable.Get(p, key)
+		v, res, err := sstable.Get(p, key)
 		if err != nil {
 			return nil, false
 		}
-		if ok {
-			return v, ok
+		switch res {
+		case sstable.Found:
+			return v, true
+		case sstable.Deleted:
+			return nil, false // 关键：删除短路，阻止旧值“复活”
+		case sstable.NotFound:
+			continue
 		}
 	}
 

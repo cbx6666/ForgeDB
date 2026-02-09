@@ -10,10 +10,7 @@ import (
 	"monolithdb/internal/types"
 )
 
-var (
-	ErrNotFound   = errors.New("sstable: not found")
-	ErrCorruptSST = errors.New("sstable: corrupt")
-)
+var	ErrCorruptSST = errors.New("sstable: corrupt")
 
 const (
 	magic uint32 = 0x46534442 // 'FSDB' = ForgeDB（仅用于识别文件）
@@ -71,10 +68,10 @@ func WriteTable(path string, entries []types.Entry) error {
 }
 
 // Get 从 SSTable 文件中查找 key。
-func Get(path string, key string) ([]byte, bool, error) {
+func Get(path string, key string) ([]byte, GetResult, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, false, err
+		return nil, NotFound, err
 	}
 	defer f.Close()
 
@@ -83,15 +80,15 @@ func Get(path string, key string) ([]byte, bool, error) {
 	// 1) 读 header
 	var m uint32
 	if err := binary.Read(r, binary.LittleEndian, &m); err != nil {
-		return nil, false, err
+		return nil, NotFound, err
 	}
 	if m != magic {
-		return nil, false, ErrCorruptSST
+		return nil, NotFound, ErrCorruptSST
 	}
 
 	var count uint32
 	if err := binary.Read(r, binary.LittleEndian, &count); err != nil {
-		return nil, false, ErrCorruptSST
+		return nil, NotFound, ErrCorruptSST
 	}
 
 	// 2) 顺序扫描 records
@@ -101,38 +98,38 @@ func Get(path string, key string) ([]byte, bool, error) {
 		var valLen uint32
 
 		if err := binary.Read(r, binary.LittleEndian, &keyLen); err != nil {
-			return nil, false, ErrCorruptSST
+			return nil, NotFound, ErrCorruptSST
 		}
 		if err := binary.Read(r, binary.LittleEndian, &valLen); err != nil {
-			return nil, false, ErrCorruptSST
+			return nil, NotFound, ErrCorruptSST
 		}
 
 		tomb, err := r.ReadByte()
 		if err != nil {
-			return nil, false, ErrCorruptSST
+			return nil, NotFound, ErrCorruptSST
 		}
 
 		keyB := make([]byte, keyLen)
 		if _, err := io.ReadFull(r, keyB); err != nil {
-			return nil, false, ErrCorruptSST
+			return nil, NotFound, ErrCorruptSST
 		}
 
 		var valB []byte
 		if valLen > 0 {
 			valB = make([]byte, valLen)
 			if _, err := io.ReadFull(r, valB); err != nil {
-				return nil, false, ErrCorruptSST
+				return nil, NotFound, ErrCorruptSST
 			}
 		}
 
 		k := string(keyB)
 		if k == target {
 			if tomb == 1 {
-				return nil, false, nil
+				return nil, Deleted, nil
 			}
-			return valB, true, nil
+			return valB, Found, nil
 		}
 	}
 
-	return nil, false, nil
+	return nil, NotFound, nil
 }
