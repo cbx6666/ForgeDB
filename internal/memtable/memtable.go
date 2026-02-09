@@ -69,6 +69,32 @@ func (m *MemTable) Range(start, end string) []types.Entry {
 	return out
 }
 
+// RangeAll 范围查询：返回 [start, end) 的有序记录（包含 tombstone）。
+// 用于 Flush 到 SSTable，保证 Delete 也会被持久化。
+func (m *MemTable) RangeAll(start, end string) []types.Entry {
+	var out []types.Entry
+
+	var n *node
+	if start == "" {
+		n = m.sl.First()
+	} else {
+		n = m.sl.FirstGE(start)
+	}
+
+	for n != nil && (end == "" || n.key < end) {
+		// 这里不跳过 tombstone
+		out = append(out, types.Entry{
+			Key:       n.key,
+			Value:     cloneBytes(n.entry.Value),
+			Tombstone: false,
+		})
+
+		n = n.forward[0]
+	}
+
+	return out
+}
+
 // cloneBytes 防御性拷贝，避免外部修改 slice 影响表内数据。
 func cloneBytes(b []byte) []byte {
 	if b == nil {
