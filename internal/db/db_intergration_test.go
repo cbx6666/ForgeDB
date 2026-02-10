@@ -20,7 +20,10 @@ func TestDBPutGet(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	v, ok := d.Get("a")
+	v, ok, err := d.Get("a")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatalf("expected key a to exist")
 	}
@@ -54,7 +57,10 @@ func TestDBPutFlushReopen(t *testing.T) {
 	}
 	defer func() { _ = d2.Close() }()
 
-	v, ok := d2.Get("k")
+	v, ok, err := d2.Get("k")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatalf("expected key k to exist after reopen")
 	}
@@ -99,7 +105,10 @@ func TestDBDeleteTombstone(t *testing.T) {
 	}
 	defer func() { _ = d2.Close() }()
 
-	v, ok := d2.Get("k")
+	v, ok, err := d2.Get("k")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if ok || v != nil {
 		t.Fatalf("expected key k to be deleted, got ok=%v v=%v", ok, v)
 	}
@@ -128,7 +137,10 @@ func TestDBDeleteOverridesSST(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	v, ok := d.Get("k")
+	v, ok, err := d.Get("k")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if ok || v != nil {
 		t.Fatalf("expected mem tombstone to override SST value, got ok=%v v=%v", ok, v)
 	}

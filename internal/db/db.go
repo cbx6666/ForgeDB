@@ -96,32 +96,32 @@ func (d *DB) Put(key string, value []byte) error {
 	return nil
 }
 
-func (d *DB) Get(key string) ([]byte, bool) {
+func (d *DB) Get(key string) ([]byte, bool, error) {
 	// 1) MemTable
 	if e, ok := d.mem.GetAll(key); ok {
 		if e.Tombstone {
-			return nil, false
+			return nil, false, nil
 		}
-		return e.Value, true
+		return e.Value, true, nil
 	}
 
 	// 2) SSTables (newest -> oldest)
 	for _, p := range d.sstables {
 		v, res, err := sstable.Get(p, key)
 		if err != nil {
-			return nil, false
+			return nil, false, err
 		}
 		switch res {
 		case sstable.Found:
-			return v, true
+			return v, true, nil
 		case sstable.Deleted:
-			return nil, false // 关键：删除短路，阻止旧值“复活”
+			return nil, false, err // 关键：删除短路，阻止旧值“复活”
 		case sstable.NotFound:
 			continue
 		}
 	}
 
-	return nil, false
+	return nil, false, nil
 }
 
 func (d *DB) Delete(key string) error {
