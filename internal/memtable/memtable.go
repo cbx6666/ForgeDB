@@ -33,6 +33,18 @@ func (m *MemTable) Get(key string) ([]byte, bool) {
 	return cloneBytes(e.Value), true
 }
 
+// GetAll 系统查询：返回原始 Entry（包含 tombstone）。
+// 用于 DB.Get 在 mem 层识别删除标记，避免旧 SST 的值复活。
+func (m *MemTable) GetAll(key string) (types.Entry, bool) {
+	e, ok := m.sl.Search(key)
+	if !ok {
+		return types.Entry{}, false
+	}
+	// 防御性拷贝 value
+	e.Value = cloneBytes(e.Value)
+	return e, true
+}
+
 // Delete 删除：写 tombstone 覆盖
 func (m *MemTable) Delete(key string) {
 	e := types.Entry{

@@ -98,8 +98,11 @@ func (d *DB) Put(key string, value []byte) error {
 
 func (d *DB) Get(key string) ([]byte, bool) {
 	// 1) MemTable
-	if v, ok := d.mem.Get(key); ok {
-		return v, true
+	if e, ok := d.mem.GetAll(key); ok {
+		if e.Tombstone {
+			return nil, false
+		}
+		return e.Value, true
 	}
 
 	// 2) SSTables (newest -> oldest)
