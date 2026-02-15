@@ -85,6 +85,9 @@ func unmarshalBloom(p []byte) (*bloom, bool) {
 
 	m := binary.LittleEndian.Uint32(p[0:4])
 	k := p[4]
+	if m == 0 || k == 0 {
+		return nil, false
+	}
 	n := binary.LittleEndian.Uint32(p[8:12])
 	if int(12+n) != len(p) || n == 0 {
 		return nil, false

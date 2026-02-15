@@ -12,9 +12,6 @@ const (
 	// 稀疏索引间隔：每隔多少条 record 写一个索引项
 	indexStride = 32
 
-	// footer 只存一个 uint64 的 indexStartOffset（8 bytes）
-	footerSize = 8
-
 	// 简单的防爆上限（防止坏文件造成 OOM）
 	maxIndexKeySize = 1 << 20 // 1MB
 	maxIndexCount   = 1 << 20 // 约 100 万条索引项，上限很宽
@@ -30,27 +27,9 @@ type indexEntry struct {
 // loadIndex 尝试从文件尾部加载索引。
 // 返回：entries, indexOffset, err
 func loadIndex(f *os.File, fileSize int64) ([]indexEntry, uint64, error) {
-	// 至少得放下：header(8) + footer(8)
-	if fileSize < int64(headerSize+footerSize) {
-		return nil, 0, ErrCorruptSST
-	}
-
-	// 读 footer：文件最后 8 字节是 indexStartOffset
-	if _, err := f.Seek(-footerSize, io.SeekEnd); err != nil {
+	indexStartOffset, _, err := loadFooter(f, fileSize)
+	if err != nil {
 		return nil, 0, err
-	}
-
-	var indexStartOffset uint64
-	if err := binary.Read(f, binary.LittleEndian, &indexStartOffset); err != nil {
-		return nil, 0, ErrCorruptSST
-	}
-
-	// 基本合法性：索引区必须在文件内，并且位于 footer 之前
-	if indexStartOffset < uint64(headerSize) {
-		return nil, 0, ErrCorruptSST
-	}
-	if int64(indexStartOffset) >= fileSize-int64(footerSize) {
-		return nil, 0, ErrCorruptSST
 	}
 
 	// Seek 到索引区起点，读 indexCount
