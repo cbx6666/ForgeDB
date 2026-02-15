@@ -59,12 +59,15 @@ func WriteTable(path string, entries []types.Entry) error {
 		return err
 	}
 
+	bf := newBloom(1<<20, 7)
+
 	// 2) 写 records 和索引
 	var idx []indexEntry
 
 	for i, e := range entries {
 		recOff := w.n
 
+		// 写索引
 		if i%indexStride == 0 {
 			idx = append(idx, indexEntry{key: e.Key, offset: recOff})
 		}
@@ -95,6 +98,9 @@ func WriteTable(path string, entries []types.Entry) error {
 				return err
 			}
 		}
+
+		// 写入 bloom
+		bf.add(e.Key)
 	}
 
 	// 写索引
@@ -119,8 +125,18 @@ func WriteTable(path string, entries []types.Entry) error {
 		}
 	}
 
-	// footer: indexStartOffset (最后 8 字节)
+	// 写 bloomStartOffset
+	bloomStartOffset := w.n
+	bloomBytes := bf.marshal()
+	if _, err := w.Write(bloomBytes); err != nil {
+		return err
+	}
+
+	// footer
 	if err := binary.Write(w, binary.LittleEndian, indexStartOffset); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, bloomStartOffset); err != nil {
 		return err
 	}
 
@@ -151,16 +167,45 @@ func Get(path string, key string) ([]byte, GetResult, error) {
 		return nil, NotFound, ErrCorruptSST
 	}
 
-	// 2) 读取索引
+	// 2) 读取 stat + footer
 	st, err := f.Stat()
 	if err != nil {
 		return nil, NotFound, err
 	}
 	fileSize := st.Size()
 
-	entries, indexStartOffset, err := loadIndex(f, fileSize)
+	indexStartOffset, bloomStartOffset, err := loadFooter(f, fileSize)
 	if err != nil {
 		return nil, NotFound, err
+	}
+
+	// 3) bloom：读取 [bloomStartOffset, footerStart)
+	footerStart := uint64(fileSize) - uint64(footerSize)
+	br := io.NewSectionReader(f, int64(bloomStartOffset), int64(footerStart-bloomStartOffset))
+
+	bloomBytes, err := io.ReadAll(br)
+	if err != nil {
+		return nil, NotFound, err
+	}
+
+	bf, ok := unmarshalBloom(bloomBytes)
+	if !ok || bf.m == 0 || bf.k == 0 {
+		return nil, NotFound, ErrCorruptSST
+	}
+
+	// Bloom 明确“不存在” => 快速返回
+	if !bf.mayContain(key) {
+		return nil, NotFound, nil
+	}
+
+	// 4) 可能存在：加载索引并选择扫描区间
+	entries, indexStartOffset2, err := loadIndex(f, fileSize)
+	if err != nil {
+		return nil, NotFound, err
+	}
+	// 防御：确保 loadIndex 读到的 offset 与 footer 一致
+	if indexStartOffset2 != indexStartOffset {
+		return nil, NotFound, ErrCorruptSST
 	}
 
 	start, end := pickScanRange(entries, indexStartOffset, key)
@@ -171,7 +216,7 @@ func Get(path string, key string) ([]byte, GetResult, error) {
 	section := io.NewSectionReader(f, int64(start), int64(end-start))
 	sr := bufio.NewReaderSize(section, 64*1024)
 
-	// 3) 根据索引查找
+	// 5) 根据索引查找
 	for {
 		var keyLen uint32
 		var valLen uint32
