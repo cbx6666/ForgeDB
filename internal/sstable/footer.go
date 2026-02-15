@@ -11,8 +11,7 @@ import (
 const footerSize = 16
 
 // loadFooter 读取并校验 footer，返回 indexStartOffset 与 bloomStartOffset。
-// 约束（对应你的文件布局）：
-//
+// 约束：
 //	header(8) ... records ... index ... bloom ... footer(16)
 //	indexStartOffset >= headerSize
 //	indexStartOffset < bloomStartOffset
