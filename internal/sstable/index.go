@@ -15,8 +15,6 @@ const (
 	// 简单的防爆上限（防止坏文件造成 OOM）
 	maxIndexKeySize = 1 << 20 // 1MB
 	maxIndexCount   = 1 << 20 // 约 100 万条索引项，上限很宽
-
-	headerSize = 8 // magic(uint32) + count(uint32)
 )
 
 type indexEntry struct {

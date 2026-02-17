@@ -10,10 +10,10 @@ import (
 	"monolithdb/internal/types"
 )
 
-var ErrCorruptSST = errors.New("sstable: corrupt")
-
 const (
 	magic uint32 = 0x46534442 // 'FSDB' = ForgeDB（仅用于识别文件）
+
+	headerSize = 8 // magic(uint32) + count(uint32)
 )
 
 type countWriter struct {
