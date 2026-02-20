@@ -41,12 +41,17 @@ func (h *mergeHeap) Pop() any {
 	return x
 }
 
-// CompactFull 将当前所有 SSTables（newest-first）合并为一个新的 SSTable。
+// CompactL0ToL1 将 L0 的所有 SST 与 L1（通常 0/1 个）合并，输出一个新的 L1 SST。
 // 合并规则：同 key 只保留最新版本（按 newest-first 决定），tombstone 也会保留。
-func (d *DB) CompactFull() error {
-	if len(d.sstables) <= 1 {
+func (d *DB) CompactL0ToL1() error {
+	if len(d.l0) == 0 {
 		return nil
 	}
+
+	// inputs：L0 在前（prio 小、更“新”），L1 在后（prio 大、更“旧”）
+	inputs := make([]string, 0, len(d.l0)+len(d.l1))
+	inputs = append(inputs, d.l0...)
+	inputs = append(inputs, d.l1...)
 
 	h := &mergeHeap{}
 	heap.Init(h)
@@ -59,8 +64,8 @@ func (d *DB) CompactFull() error {
 		}
 	}()
 
-	// 1) 初始化堆：每个 SST 放入当前 record
-	for prio, path := range d.sstables { // prio=0 最新
+	// 初始化堆
+	for prio, path := range inputs {
 		it, err := sstable.NewIter(path)
 		if err != nil {
 			return err
@@ -76,20 +81,20 @@ func (d *DB) CompactFull() error {
 		}
 	}
 
-	// 2) 多路归并：key 升序输出；同 key 保留 newest-first 的那条
+	// 多路归并：同 key 只取最新
 	merged := make([]types.Entry, 0, 1024)
-	lastKey := ""
+	var lastKey string
+	hasLast := false
 
 	for h.Len() > 0 {
 		item := heap.Pop(h).(heapItem)
 
-		// 去重：新版本的优先级更高，同 key 的旧版本跳过
-		if item.ent.Key != lastKey {
+		if !hasLast || item.ent.Key != lastKey {
 			merged = append(merged, item.ent)
 			lastKey = item.ent.Key
+			hasLast = true
 		}
 
-		// 推进该 iterator
 		if err := item.it.Next(); err != nil {
 			return err
 		}
@@ -99,9 +104,9 @@ func (d *DB) CompactFull() error {
 		}
 	}
 
-	// 3) 写新 SST（临时文件 -> rename）
+	// 写新 L1（tmp -> rename）
 	name := fmt.Sprintf("%06d.sst", d.nextID)
-	finalPath := filepath.Join(d.sstDir, name)
+	finalPath := filepath.Join(d.l1Dir, name)
 	tmpPath := finalPath + ".tmp"
 
 	if err := sstable.WriteTable(tmpPath, merged); err != nil {
@@ -113,13 +118,20 @@ func (d *DB) CompactFull() error {
 		return err
 	}
 
-	// 4) 替换 sstables：只保留新表（newest-first）
-	old := d.sstables
-	d.sstables = []string{finalPath}
+	// 先保存旧文件列表，最后统一删除
+	oldL0 := d.l0
+	oldL1 := d.l1
+
+	// 更新内存状态：L0 清空，L1 替换成新文件（newest-first）
+	d.l0 = nil
+	d.l1 = []string{finalPath}
 	d.nextID++
 
-	// 5) 删除旧表（最后删，避免中途出错丢数据）
-	for _, p := range old {
+	// 最后删旧文件（避免中途出错丢数据）
+	for _, p := range oldL0 {
+		_ = os.Remove(p)
+	}
+	for _, p := range oldL1 {
 		_ = os.Remove(p)
 	}
 

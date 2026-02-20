@@ -22,9 +22,13 @@ type DB struct {
 	dir     string
 	walPath string
 	sstDir  string
+	l0Dir   string
+	l1Dir   string
 
-	sstables []string
-	nextID   uint64
+	l0 []string
+	l1 []string
+
+	nextID uint64
 }
 
 func Open(dir string) (*DB, error) {
@@ -34,6 +38,14 @@ func Open(dir string) (*DB, error) {
 
 	sstDir := filepath.Join(dir, "sst")
 	if err := os.MkdirAll(sstDir, 0o755); err != nil {
+		return nil, err
+	}
+	l0Dir := filepath.Join(sstDir, "l0")
+	l1Dir := filepath.Join(sstDir, "l1")
+	if err := os.MkdirAll(l0Dir, 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(l1Dir, 0o755); err != nil {
 		return nil, err
 	}
 
@@ -64,20 +76,33 @@ func Open(dir string) (*DB, error) {
 		}
 	}
 
-	sstables, nextID, err := scanSSTables(sstDir)
+	l0, max0, err := scanSSTables(l0Dir)
 	if err != nil {
 		_ = w.Close()
 		return nil, err
 	}
+	l1, max1, err := scanSSTables(l1Dir)
+	if err != nil {
+		_ = w.Close()
+		return nil, err
+	}
+	nextID := max0
+	if max1 > nextID {
+		nextID = max1
+	}
+	nextID++
 
 	return &DB{
-		mem:      m,
-		wal:      w,
-		dir:      dir,
-		walPath:  walPath,
-		sstDir:   sstDir,
-		sstables: sstables,
-		nextID:   nextID,
+		mem:     m,
+		wal:     w,
+		dir:     dir,
+		walPath: walPath,
+		sstDir:  sstDir,
+		l0Dir:   l0Dir,
+		l1Dir:   l1Dir,
+		l0:      l0,
+		l1:      l1,
+		nextID:  nextID,
 	}, nil
 }
 
@@ -107,8 +132,24 @@ func (d *DB) Get(key string) ([]byte, bool, error) {
 		return e.Value, true, nil
 	}
 
-	// 2) SSTables (newest -> oldest)
-	for _, p := range d.sstables {
+	// 2) L0 (newest -> oldest)
+	for _, p := range d.l0 {
+		v, res, err := sstable.Get(p, key)
+		if err != nil {
+			return nil, false, err
+		}
+		switch res {
+		case sstable.Found:
+			return v, true, nil
+		case sstable.Deleted:
+			return nil, false, nil // 关键：删除短路，阻止旧值“复活”
+		case sstable.NotFound:
+			continue
+		}
+	}
+
+	// 3) L1 (newest -> oldest)
+	for _, p := range d.l1 {
 		v, res, err := sstable.Get(p, key)
 		if err != nil {
 			return nil, false, err
@@ -144,7 +185,7 @@ func (d *DB) Flush() error {
 
 	// 生成新 SSTable 文件名
 	name := fmt.Sprintf("%06d.sst", d.nextID)
-	path := filepath.Join(d.sstDir, name)
+	path := filepath.Join(d.l0Dir, name)
 
 	// 先写到临时文件，再 rename，避免写一半崩溃留下半成品
 	tmp := path + ".tmp"
@@ -158,7 +199,7 @@ func (d *DB) Flush() error {
 	}
 
 	// 把新表放到列表最前面
-	d.sstables = append([]string{path}, d.sstables...)
+	d.l0 = append([]string{path}, d.l0...)
 	d.nextID++
 
 	// 清空 MemTable
@@ -179,8 +220,8 @@ func (d *DB) Flush() error {
 	d.wal = w
 
 	// 自动 compaction
-	if len(d.sstables) >= autoCompactThreshold {
-		if err := d.CompactFull(); err != nil {
+	if len(d.l0) >= autoCompactThreshold {
+		if err := d.CompactL0ToL1(); err != nil {
 			return err
 		}
 	}
@@ -188,7 +229,7 @@ func (d *DB) Flush() error {
 	return nil
 }
 
-func scanSSTables(sstDir string) (paths []string, nextID uint64, err error) {
+func scanSSTables(sstDir string) (paths []string, maxID uint64, err error) {
 	// 匹配这个目录下所有以 .sst 结尾的文件名
 	glob := filepath.Join(sstDir, "*.sst")
 	list, err := filepath.Glob(glob)
@@ -198,7 +239,7 @@ func scanSSTables(sstDir string) (paths []string, nextID uint64, err error) {
 
 	sort.Strings(list)
 
-	var maxID uint64 = 0
+	maxID = 0
 	for _, p := range list {
 		id, ok := parseSSTID(p)
 		if ok && id > maxID {
@@ -211,7 +252,7 @@ func scanSSTables(sstDir string) (paths []string, nextID uint64, err error) {
 		list[i], list[j] = list[j], list[i]
 	}
 
-	return list, maxID + 1, nil
+	return list, maxID, nil
 }
 
 func parseSSTID(path string) (uint64, bool) {
