@@ -86,7 +86,12 @@ func TestDB_CompactFull_CorrectnessAndReopen(t *testing.T) {
 
 func TestDB_CompactFull_KeepsNewestValue(t *testing.T) {
 	dir := t.TempDir()
-	d, _ := Open(dir)
+
+	d, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
 
 	_ = d.Put("A", []byte("1"))
 	_ = d.Flush()

@@ -13,6 +13,8 @@ import (
 	"monolithdb/internal/wal"
 )
 
+const autoCompactThreshold = 4
+
 type DB struct {
 	mem *memtable.MemTable
 	wal *wal.WAL
@@ -175,6 +177,13 @@ func (d *DB) Flush() error {
 		return err
 	}
 	d.wal = w
+
+	// 自动 compaction
+	if len(d.sstables) >= autoCompactThreshold {
+		if err := d.CompactFull(); err != nil {
+			return err
+		}
+	}
 
 	return nil
 }
