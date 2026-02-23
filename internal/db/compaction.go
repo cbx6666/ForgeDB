@@ -123,38 +123,27 @@ func (d *DB) CompactL0ToL1() error {
 		return nil
 	}
 
-	// 6) 写新的 L1 文件（tmp -> rename）
-	name := fmt.Sprintf("%06d.sst", d.nextID)
-	finalPath := filepath.Join(d.l1Dir, name)
-	tmpPath := finalPath + ".tmp"
-
-	if err := sstable.WriteTable(tmpPath, merged); err != nil {
-		_ = os.Remove(tmpPath)
+	// 6) 写新的 L1 runs（多文件，tmp -> rename）
+	newRuns, _, err := d.writeL1Runs(merged)
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmpPath, finalPath); err != nil {
-		_ = os.Remove(tmpPath)
-		return err
+	if len(newRuns) == 0 {
+		return nil
 	}
 
-	newLF := levelFile{
-		path:   finalPath,
-		minKey: merged[0].Key,
-		maxKey: merged[len(merged)-1].Key,
-	}
-
-	// 7) 构造新 L1：只替换 overlap 区间
-	newL1 := make([]levelFile, 0, len(d.l1)-len(overIdx)+1)
+	// 7) 构造新 L1：只替换 overlap 区间（插入多个 runs）
+	newL1 := make([]levelFile, 0, len(d.l1)-len(overIdx)+len(newRuns))
 	if len(overIdx) == 0 {
 		// 没 overlap：插入后排序（保持 minKey 升序）
 		newL1 = append(newL1, d.l1...)
-		newL1 = append(newL1, newLF)
+		newL1 = append(newL1, newRuns...)
 		sort.Slice(newL1, func(i, j int) bool { return newL1[i].minKey < newL1[j].minKey })
 	} else {
 		start := overIdx[0]
 		end := overIdx[len(overIdx)-1] + 1
 		newL1 = append(newL1, d.l1[:start]...)
-		newL1 = append(newL1, newLF)
+		newL1 = append(newL1, newRuns...)
 		newL1 = append(newL1, d.l1[end:]...)
 	}
 
@@ -167,7 +156,6 @@ func (d *DB) CompactL0ToL1() error {
 
 	d.l0 = remainL0
 	d.l1 = newL1
-	d.nextID++
 
 	// 9) 最后删除旧文件
 	for _, p := range oldL0 {
@@ -176,5 +164,58 @@ func (d *DB) CompactL0ToL1() error {
 	for _, p := range oldL1 {
 		_ = os.Remove(p)
 	}
+
 	return nil
+}
+
+func (d *DB) writeL1Runs(merged []types.Entry) ([]levelFile, []string, error) {
+	// 返回：
+	// - newRuns：新生成的 L1 文件信息（minKey/maxKey）
+	// - createdPaths：实际创建的文件路径（方便出错时清理）
+	if len(merged) == 0 {
+		return nil, nil, nil
+	}
+
+	newRuns := make([]levelFile, 0, (len(merged)+l1RunMaxEntries-1)/l1RunMaxEntries)
+	created := make([]string, 0, cap(newRuns))
+
+	for i := 0; i < len(merged); {
+		j := i + l1RunMaxEntries
+		if j > len(merged) {
+			j = len(merged)
+		}
+		chunk := merged[i:j]
+
+		name := fmt.Sprintf("%06d.sst", d.nextID)
+		finalPath := filepath.Join(d.l1Dir, name)
+		tmpPath := finalPath + ".tmp"
+
+		if err := sstable.WriteTable(tmpPath, chunk); err != nil {
+			_ = os.Remove(tmpPath)
+			// 清理已创建的 run
+			for _, p := range created {
+				_ = os.Remove(p)
+			}
+			return nil, nil, err
+		}
+		if err := os.Rename(tmpPath, finalPath); err != nil {
+			_ = os.Remove(tmpPath)
+			for _, p := range created {
+				_ = os.Remove(p)
+			}
+			return nil, nil, err
+		}
+
+		created = append(created, finalPath)
+		newRuns = append(newRuns, levelFile{
+			path:   finalPath,
+			minKey: chunk[0].Key,
+			maxKey: chunk[len(chunk)-1].Key,
+		})
+
+		d.nextID++
+		i = j
+	}
+
+	return newRuns, created, nil
 }

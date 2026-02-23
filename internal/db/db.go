@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	
 
 	"monolithdb/internal/memtable"
 	"monolithdb/internal/sstable"
@@ -14,6 +13,7 @@ import (
 const (
 	autoCompactThreshold = 4
 	l0PickN              = 2
+	l1RunMaxEntries      = 256
 )
 
 type levelFile struct {
@@ -165,7 +165,7 @@ func (d *DB) Get(key string) ([]byte, bool, error) {
 		case sstable.Found:
 			return v, true, nil
 		case sstable.Deleted:
-			return nil, false, nil 
+			return nil, false, nil
 		}
 	}
 
