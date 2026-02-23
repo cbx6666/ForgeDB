@@ -4,16 +4,23 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
-	"strconv"
-	"strings"
+	
 
 	"monolithdb/internal/memtable"
 	"monolithdb/internal/sstable"
 	"monolithdb/internal/wal"
 )
 
-const autoCompactThreshold = 4
+const (
+	autoCompactThreshold = 4
+	l0PickN              = 2
+)
+
+type levelFile struct {
+	path   string
+	minKey string
+	maxKey string
+}
 
 type DB struct {
 	mem *memtable.MemTable
@@ -26,7 +33,7 @@ type DB struct {
 	l1Dir   string
 
 	l0 []string
-	l1 []string
+	l1 []levelFile
 
 	nextID uint64
 }
@@ -81,7 +88,7 @@ func Open(dir string) (*DB, error) {
 		_ = w.Close()
 		return nil, err
 	}
-	l1, max1, err := scanSSTables(l1Dir)
+	l1, max1, err := scanL1(l1Dir)
 	if err != nil {
 		_ = w.Close()
 		return nil, err
@@ -148,8 +155,8 @@ func (d *DB) Get(key string) ([]byte, bool, error) {
 		}
 	}
 
-	// 3) L1 (newest -> oldest)
-	for _, p := range d.l1 {
+	// 3) L1 (minKey 升序)
+	if p, ok := d.findL1File(key); ok {
 		v, res, err := sstable.Get(p, key)
 		if err != nil {
 			return nil, false, err
@@ -158,9 +165,7 @@ func (d *DB) Get(key string) ([]byte, bool, error) {
 		case sstable.Found:
 			return v, true, nil
 		case sstable.Deleted:
-			return nil, false, err // 关键：删除短路，阻止旧值“复活”
-		case sstable.NotFound:
-			continue
+			return nil, false, nil 
 		}
 	}
 
@@ -220,47 +225,11 @@ func (d *DB) Flush() error {
 	d.wal = w
 
 	// 自动 compaction
-	if len(d.l0) >= autoCompactThreshold {
+	if len(d.l0) > autoCompactThreshold {
 		if err := d.CompactL0ToL1(); err != nil {
 			return err
 		}
 	}
 
 	return nil
-}
-
-func scanSSTables(sstDir string) (paths []string, maxID uint64, err error) {
-	// 匹配这个目录下所有以 .sst 结尾的文件名
-	glob := filepath.Join(sstDir, "*.sst")
-	list, err := filepath.Glob(glob)
-	if err != nil {
-		return nil, 1, err
-	}
-
-	sort.Strings(list)
-
-	maxID = 0
-	for _, p := range list {
-		id, ok := parseSSTID(p)
-		if ok && id > maxID {
-			maxID = id
-		}
-	}
-
-	// 内存里用 newest-first，所以反转
-	for i, j := 0, len(list)-1; i < j; i, j = i+1, j-1 {
-		list[i], list[j] = list[j], list[i]
-	}
-
-	return list, maxID, nil
-}
-
-func parseSSTID(path string) (uint64, bool) {
-	base := filepath.Base(path)                // 000001.sst
-	name := strings.TrimSuffix(base, ".sst")   // 000001
-	id, err := strconv.ParseUint(name, 10, 64) // 把字符串解析成无符号整数，base：进制，bitSize：目标位宽
-	if err != nil {
-		return 0, false
-	}
-	return id, true
 }
