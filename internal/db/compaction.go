@@ -234,6 +234,7 @@ func (d *DB) writeRuns(dstLevel int, merged []types.Entry) ([]levelFile, []strin
 
 		created = append(created, finalPath)
 		newRuns = append(newRuns, levelFile{
+			id:     d.nextID,
 			path:   finalPath,
 			minKey: chunk[0].Key,
 			maxKey: chunk[len(chunk)-1].Key,

@@ -53,7 +53,7 @@ func scanLevelN(l1Dir string) (files []levelFile, maxID uint64, err error) {
 		if err != nil {
 			return nil, 0, err
 		}
-		files = append(files, levelFile{path: p, minKey: minK, maxKey: maxK})
+		files = append(files, levelFile{id: id, path: p, minKey: minK, maxKey: maxK})
 	}
 
 	sort.Slice(files, func(i, j int) bool {
@@ -124,27 +124,52 @@ func pickOldestL0(l0 []string, n int) (picked, remain []string) {
 	return picked, remain
 }
 
-func pickOldestRuns(runs []levelFile, n int) (picked, remain []levelFile) {
-    if len(runs) <= n {
-        return append([]levelFile(nil), runs...), nil
-    }
-    picked = append([]levelFile(nil), runs[len(runs)-n:]...)
-    remain = append([]levelFile(nil), runs[:len(runs)-n]...)
-    return picked, remain
+func pickOldestRuns(files []levelFile, n int) (picked, remain []levelFile) {
+	if len(files) <= n {
+		return append([]levelFile(nil), files...), nil
+	}
+
+	// 找 id 最小的 n 个
+	idx := make([]int, len(files))
+	for i := range files {
+		idx[i] = i
+	}
+
+	sort.Slice(idx, func(i, j int) bool {
+		return files[idx[i]].id < files[idx[j]].id
+	})
+
+	pickedSet := make(map[int]struct{}, n)
+	for i := 0; i < n; i++ {
+		pickedSet[idx[i]] = struct{}{}
+	}
+
+	picked = make([]levelFile, 0, n)
+	remain = make([]levelFile, 0, len(files)-n)
+
+	// 保留文件原始顺序
+	for i, f := range files {
+		if _, ok := pickedSet[i]; ok {
+			picked = append(picked, f)
+		} else {
+			remain = append(remain, f)
+		}
+	}
+	return
 }
 
 func findRun(runs []levelFile, key string) (string, bool) {
-    i := sort.Search(len(runs), func(i int) bool {
-        return runs[i].minKey > key
-    }) - 1
-    if i < 0 {
-        return "", false
-    }
-    f := runs[i]
-    if key >= f.minKey && key <= f.maxKey {
-        return f.path, true
-    }
-    return "", false
+	i := sort.Search(len(runs), func(i int) bool {
+		return runs[i].minKey > key
+	}) - 1
+	if i < 0 {
+		return "", false
+	}
+	f := runs[i]
+	if key >= f.minKey && key <= f.maxKey {
+		return f.path, true
+	}
+	return "", false
 }
 
 // 返回 runs 中所有与 [minK, maxK] 有交集的文件索引（适用于 L>=1 的 non-overlap runs）。

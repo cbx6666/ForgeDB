@@ -21,6 +21,7 @@ const (
 )
 
 type levelFile struct {
+	id     uint64
 	path   string
 	minKey string
 	maxKey string
@@ -276,6 +277,6 @@ func (d *DB) Flush() error {
 			return err
 		}
 	}
-	
+
 	return nil
 }
