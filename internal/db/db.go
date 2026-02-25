@@ -10,16 +10,6 @@ import (
 	"monolithdb/internal/wal"
 )
 
-const (
-	numLevels = 3
-
-	autoCompactThreshold = 4
-	l0PickN              = 2
-	l1PickN              = 1
-	l1RunMaxEntries      = 256
-	l1MaxRuns            = 8
-)
-
 type levelFile struct {
 	id     uint64
 	path   string
@@ -27,19 +17,14 @@ type levelFile struct {
 	maxKey string
 }
 
-type Level struct {
+type level struct {
 	id  int
 	dir string
 
 	// L0 用：newest-first，允许 overlap
 	l0Paths []string
-
 	// L>=1 用：按 minKey 升序，且不 overlap（由 compaction 保证）
 	runs []levelFile
-
-	// 配置
-	maxFiles      int
-	runMaxEntries int
 }
 
 type DB struct {
@@ -50,12 +35,21 @@ type DB struct {
 	walPath string
 	sstDir  string
 
-	levels []Level
+	levels []level
+	opt    Options
 
 	nextID uint64
 }
 
 func Open(dir string) (*DB, error) {
+	return OpenWithOptions(dir, defaultOptions())
+}
+
+func OpenWithOptions(dir string, opt Options) (*DB, error) {
+	if err := validateOptions(opt); err != nil {
+		return nil, err
+	}
+
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -92,17 +86,17 @@ func Open(dir string) (*DB, error) {
 		}
 	}
 
-	levels := make([]Level, 0, numLevels)
+	levels := make([]level, 0, opt.numLevels)
 	var maxID uint64 = 0
 
-	for i := 0; i < numLevels; i++ {
+	for i := 0; i < opt.numLevels; i++ {
 		ldir := filepath.Join(sstDir, fmt.Sprintf("l%d", i))
 		if err := os.MkdirAll(ldir, 0o755); err != nil {
 			_ = w.Close()
 			return nil, err
 		}
 
-		lv := Level{id: i, dir: ldir}
+		lv := level{id: i, dir: ldir}
 
 		if i == 0 {
 			paths, mid, err := scanLevel0(ldir)
@@ -111,7 +105,6 @@ func Open(dir string) (*DB, error) {
 				return nil, err
 			}
 			lv.l0Paths = paths
-			lv.maxFiles = autoCompactThreshold
 			if mid > maxID {
 				maxID = mid
 			}
@@ -122,7 +115,6 @@ func Open(dir string) (*DB, error) {
 				return nil, err
 			}
 			lv.runs = runs
-			lv.runMaxEntries = l1RunMaxEntries // 先统一用同一份配置
 			if mid > maxID {
 				maxID = mid
 			}
@@ -140,6 +132,7 @@ func Open(dir string) (*DB, error) {
 		walPath: walPath,
 		sstDir:  sstDir,
 		levels:  levels,
+		opt:     opt,
 		nextID:  nextID,
 	}, nil
 }
@@ -264,17 +257,24 @@ func (d *DB) Flush() error {
 	}
 	d.wal = w
 
-	// L0 -> L1
-	if len(d.levels[0].l0Paths) > d.levels[0].maxFiles {
-		if err := d.Compact(0); err != nil {
-			return err
+	// compaction
+	for level := 0; level < len(d.levels)-1; level++ {
+		maxFiles := d.opt.levels[level].maxFiles
+		if maxFiles <= 0 {
+			continue
 		}
-	}
 
-	// L1 -> L2
-	if len(d.levels) > 2 && len(d.levels[1].runs) > l1MaxRuns {
-		if err := d.Compact(1); err != nil {
-			return err
+		over := false
+		if level == 0 {
+			over = len(d.levels[level].l0Paths) > maxFiles
+		} else {
+			over = len(d.levels[level].runs) > maxFiles
+		}
+
+		if over {
+			if err := d.Compact(level); err != nil {
+				return err
+			}
 		}
 	}
 

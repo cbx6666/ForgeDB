@@ -63,23 +63,28 @@ func (d *DB) Compact(level int) error {
 
 	// 1) pick inputs from src
 	var pickedPaths []string
+	commitSrc := func() {}
+	pickN := d.opt.levels[level].pickN
+	if pickN <= 0 {
+		return nil
+	}
 
 	if level == 0 {
-		picked, remain := pickOldestL0(src.l0Paths, l0PickN)
+		picked, remain := pickOldestL0(src.l0Paths, pickN)
 		if len(picked) == 0 {
 			return nil
 		}
 		pickedPaths = picked
-		src.l0Paths = remain
+		commitSrc = func() { src.l0Paths = remain }
 	} else {
-		pickedRuns, remainRuns := pickOldestRuns(src.runs, l1PickN)
+		pickedRuns, remainRuns := pickOldestRuns(src.runs, pickN)
 		if len(pickedRuns) == 0 {
 			return nil
 		}
 		for _, f := range pickedRuns {
 			pickedPaths = append(pickedPaths, f.path)
 		}
-		src.runs = remainRuns
+		commitSrc = func() { src.runs = remainRuns }
 	}
 
 	// 2) range of picked
@@ -99,50 +104,10 @@ func (d *DB) Compact(level int) error {
 	}
 
 	// 5) heap merge
-	h := &mergeHeap{}
-	heap.Init(h)
-
-	var iters []*sstable.Iter
-	defer func() {
-		for _, it := range iters {
-			_ = it.Close()
-		}
-	}()
-
-	for prio, path := range inputs {
-		it, err := sstable.NewIter(path)
-		if err != nil {
-			return err
-		}
-		iters = append(iters, it)
-		if it.Valid() {
-			heap.Push(h, heapItem{it: it, ent: it.Entry(), priority: prio})
-		}
+	merged, err := mergeIters(inputs)
+	if err != nil {
+		return err
 	}
-
-	merged := make([]types.Entry, 0, 1024)
-	var lastKey string
-	hasLast := false
-
-	for h.Len() > 0 {
-		item := heap.Pop(h).(heapItem)
-
-		// 同 key 只保留最先弹出的（priority 最小那条）
-		if !hasLast || item.ent.Key != lastKey {
-			merged = append(merged, item.ent)
-			lastKey = item.ent.Key
-			hasLast = true
-		}
-
-		if err := item.it.Next(); err != nil {
-			return err
-		}
-		if item.it.Valid() {
-			item.ent = item.it.Entry()
-			heap.Push(h, item)
-		}
-	}
-
 	if len(merged) == 0 {
 		return nil
 	}
@@ -170,15 +135,16 @@ func (d *DB) Compact(level int) error {
 		newDst = append(newDst, dst.runs[end:]...)
 	}
 
-	// 8) collect old files to delete
+	// 8) collect old files to delete (MUST before install)
+	oldSrc := append([]string(nil), pickedPaths...)
+
 	oldDst := make([]string, 0, len(overIdx))
 	for _, i := range overIdx {
 		oldDst = append(oldDst, dst.runs[i].path)
 	}
-	// src 的 pickedPaths 也要删
-	oldSrc := pickedPaths
 
-	// 9) update dst
+	// 9) install metadata (atomic in-memory install)
+	commitSrc()
 	dst.runs = newDst
 
 	// 10) delete old files
@@ -192,16 +158,63 @@ func (d *DB) Compact(level int) error {
 	return nil
 }
 
+func mergeIters(paths []string) ([]types.Entry, error) {
+	h := &mergeHeap{}
+	heap.Init(h)
+
+	var iters []*sstable.Iter
+	defer func() {
+		for _, it := range iters {
+			_ = it.Close()
+		}
+	}()
+
+	for prio, path := range paths {
+		it, err := sstable.NewIter(path)
+		if err != nil {
+			return nil, err
+		}
+		iters = append(iters, it)
+		if it.Valid() {
+			heap.Push(h, heapItem{it: it, ent: it.Entry(), priority: prio})
+		}
+	}
+
+	merged := make([]types.Entry, 0, 1024)
+	var lastKey string
+	hasLast := false
+
+	for h.Len() > 0 {
+		item := heap.Pop(h).(heapItem)
+
+		// 同 key 只保留最先弹出的（priority 最小那条）
+		if !hasLast || item.ent.Key != lastKey {
+			merged = append(merged, item.ent)
+			lastKey = item.ent.Key
+			hasLast = true
+		}
+
+		if err := item.it.Next(); err != nil {
+			return nil, err
+		}
+		if item.it.Valid() {
+			item.ent = item.it.Entry()
+			heap.Push(h, item)
+		}
+	}
+
+	return merged, nil
+}
+
 func (d *DB) writeRuns(dstLevel int, merged []types.Entry) ([]levelFile, []string, error) {
 	if len(merged) == 0 {
 		return nil, nil, nil
 	}
 
-	runMax := d.levels[dstLevel].runMaxEntries
+	runMax := d.opt.levels[dstLevel].runMaxEntries
 	if runMax <= 0 {
-		runMax = l1RunMaxEntries
+		return nil, nil, fmt.Errorf("db: invalid runMaxEntries for level %d", dstLevel)
 	}
-
 	newRuns := make([]levelFile, 0, (len(merged)+runMax-1)/runMax)
 	created := make([]string, 0, cap(newRuns))
 
