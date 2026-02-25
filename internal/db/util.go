@@ -9,12 +9,12 @@ import (
 	"monolithdb/internal/sstable"
 )
 
-func scanSSTables(sstDir string) (paths []string, maxID uint64, err error) {
+func scanLevel0(sstDir string) (paths []string, maxID uint64, err error) {
 	// 匹配这个目录下所有以 .sst 结尾的文件名
 	glob := filepath.Join(sstDir, "*.sst")
 	list, err := filepath.Glob(glob)
 	if err != nil {
-		return nil, 1, err
+		return nil, 0, err
 	}
 
 	sort.Strings(list)
@@ -35,7 +35,7 @@ func scanSSTables(sstDir string) (paths []string, maxID uint64, err error) {
 	return list, maxID, nil
 }
 
-func scanL1(l1Dir string) (files []levelFile, maxID uint64, err error) {
+func scanLevelN(l1Dir string) (files []levelFile, maxID uint64, err error) {
 	glob := filepath.Join(l1Dir, "*.sst")
 	list, err := filepath.Glob(glob)
 	if err != nil {
@@ -124,23 +124,31 @@ func pickOldestL0(l0 []string, n int) (picked, remain []string) {
 	return picked, remain
 }
 
-func (d *DB) findL1File(key string) (string, bool) {
-	// 找到最后一个 minKey <= key 的文件
-	i := sort.Search(len(d.l1), func(i int) bool {
-		return d.l1[i].minKey > key
-	}) - 1
-	if i < 0 {
-		return "", false
-	}
-	f := d.l1[i]
-	if key >= f.minKey && key <= f.maxKey {
-		return f.path, true
-	}
-	return "", false
+func pickOldestRuns(runs []levelFile, n int) (picked, remain []levelFile) {
+    if len(runs) <= n {
+        return append([]levelFile(nil), runs...), nil
+    }
+    picked = append([]levelFile(nil), runs[len(runs)-n:]...)
+    remain = append([]levelFile(nil), runs[:len(runs)-n]...)
+    return picked, remain
 }
 
-// 返回 L1 中所有与给定 [minK, maxK] 范围存在交集（重叠）的文件索引。
-func overlappedL1(files []levelFile, minK, maxK string) (idx []int) {
+func findRun(runs []levelFile, key string) (string, bool) {
+    i := sort.Search(len(runs), func(i int) bool {
+        return runs[i].minKey > key
+    }) - 1
+    if i < 0 {
+        return "", false
+    }
+    f := runs[i]
+    if key >= f.minKey && key <= f.maxKey {
+        return f.path, true
+    }
+    return "", false
+}
+
+// 返回 runs 中所有与 [minK, maxK] 有交集的文件索引（适用于 L>=1 的 non-overlap runs）。
+func overlappedRuns(files []levelFile, minK, maxK string) (idx []int) {
 	// 找第一个 maxKey >= minK 的位置
 	start := sort.Search(len(files), func(i int) bool {
 		return files[i].maxKey >= minK

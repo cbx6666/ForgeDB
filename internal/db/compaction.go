@@ -42,35 +42,60 @@ func (h *mergeHeap) Pop() any {
 	return x
 }
 
-// CompactL0ToL1
-// - 每次只选择最老的 l0PickN 个 L0 文件参与 compaction
-// - 只合并与选中 L0 key-range 重叠的那段 L1 文件
-// - 输出 1 个新的 L1 文件，并只替换 L1 的 overlap 区间
-func (d *DB) CompactL0ToL1() error {
-	if len(d.l0) == 0 {
+func (d *DB) Compact(level int) error {
+	if level < 0 || level+1 >= len(d.levels) {
 		return nil
 	}
 
-	// 1) 选最老的 N 个 L0
-	pickedL0, remainL0 := pickOldestL0(d.l0, l0PickN)
-	if len(pickedL0) == 0 {
-		return nil
+	src := &d.levels[level]
+	dst := &d.levels[level+1]
+
+	// src 为空直接返回
+	if level == 0 {
+		if len(src.l0Paths) == 0 {
+			return nil
+		}
+	} else {
+		if len(src.runs) == 0 {
+			return nil
+		}
 	}
 
-	// 2) 计算 pickedL0 的 key-range
-	minK, maxK, err := rangeOfFiles(pickedL0)
+	// 1) pick inputs from src
+	var pickedPaths []string
+
+	if level == 0 {
+		picked, remain := pickOldestL0(src.l0Paths, l0PickN)
+		if len(picked) == 0 {
+			return nil
+		}
+		pickedPaths = picked
+		src.l0Paths = remain
+	} else {
+		pickedRuns, remainRuns := pickOldestRuns(src.runs, l1PickN)
+		if len(pickedRuns) == 0 {
+			return nil
+		}
+		for _, f := range pickedRuns {
+			pickedPaths = append(pickedPaths, f.path)
+		}
+		src.runs = remainRuns
+	}
+
+	// 2) range of picked
+	minK, maxK, err := rangeOfFiles(pickedPaths)
 	if err != nil {
 		return err
 	}
 
-	// 3) 找 overlap 的 L1（返回 index 列表）
-	overIdx := overlappedL1(d.l1, minK, maxK)
+	// 3) overlap in dst (dst 是 L>=1 runs)
+	overIdx := overlappedRuns(dst.runs, minK, maxK)
 
-	// 4) inputs：pickedL0 在前（prio 小，更新），overlap L1 在后
-	inputs := make([]string, 0, len(pickedL0)+len(overIdx))
-	inputs = append(inputs, pickedL0...)
+	// 4) build inputs: pickedPaths first, overlapped dst after
+	inputs := make([]string, 0, len(pickedPaths)+len(overIdx))
+	inputs = append(inputs, pickedPaths...)
 	for _, i := range overIdx {
-		inputs = append(inputs, d.l1[i].path)
+		inputs = append(inputs, dst.runs[i].path)
 	}
 
 	// 5) heap merge
@@ -118,13 +143,12 @@ func (d *DB) CompactL0ToL1() error {
 		}
 	}
 
-	// 如果 merged 为空：说明 pickedL0/overlapL1 都是空表（理论上不该发生），直接返回
 	if len(merged) == 0 {
 		return nil
 	}
 
-	// 6) 写新的 L1 runs（多文件，tmp -> rename）
-	newRuns, _, err := d.writeL1Runs(merged)
+	// 6) writeRuns(level+1)
+	newRuns, _, err := d.writeRuns(level+1, merged)
 	if err != nil {
 		return err
 	}
@@ -132,62 +156,64 @@ func (d *DB) CompactL0ToL1() error {
 		return nil
 	}
 
-	// 7) 构造新 L1：只替换 overlap 区间（插入多个 runs）
-	newL1 := make([]levelFile, 0, len(d.l1)-len(overIdx)+len(newRuns))
+	// 7) replace overlap in dst
+	newDst := make([]levelFile, 0, len(dst.runs)-len(overIdx)+len(newRuns))
 	if len(overIdx) == 0 {
-		// 没 overlap：插入后排序（保持 minKey 升序）
-		newL1 = append(newL1, d.l1...)
-		newL1 = append(newL1, newRuns...)
-		sort.Slice(newL1, func(i, j int) bool { return newL1[i].minKey < newL1[j].minKey })
+		newDst = append(newDst, dst.runs...)
+		newDst = append(newDst, newRuns...)
+		sort.Slice(newDst, func(i, j int) bool { return newDst[i].minKey < newDst[j].minKey })
 	} else {
 		start := overIdx[0]
 		end := overIdx[len(overIdx)-1] + 1
-		newL1 = append(newL1, d.l1[:start]...)
-		newL1 = append(newL1, newRuns...)
-		newL1 = append(newL1, d.l1[end:]...)
+		newDst = append(newDst, dst.runs[:start]...)
+		newDst = append(newDst, newRuns...)
+		newDst = append(newDst, dst.runs[end:]...)
 	}
 
-	// 8) 先保存要删除的输入文件，再更新内存状态
-	oldL0 := pickedL0
-	oldL1 := make([]string, 0, len(overIdx))
+	// 8) collect old files to delete
+	oldDst := make([]string, 0, len(overIdx))
 	for _, i := range overIdx {
-		oldL1 = append(oldL1, d.l1[i].path)
+		oldDst = append(oldDst, dst.runs[i].path)
 	}
+	// src 的 pickedPaths 也要删
+	oldSrc := pickedPaths
 
-	d.l0 = remainL0
-	d.l1 = newL1
+	// 9) update dst
+	dst.runs = newDst
 
-	// 9) 最后删除旧文件
-	for _, p := range oldL0 {
+	// 10) delete old files
+	for _, p := range oldSrc {
 		_ = os.Remove(p)
 	}
-	for _, p := range oldL1 {
+	for _, p := range oldDst {
 		_ = os.Remove(p)
 	}
 
 	return nil
 }
 
-func (d *DB) writeL1Runs(merged []types.Entry) ([]levelFile, []string, error) {
-	// 返回：
-	// - newRuns：新生成的 L1 文件信息（minKey/maxKey）
-	// - createdPaths：实际创建的文件路径（方便出错时清理）
+func (d *DB) writeRuns(dstLevel int, merged []types.Entry) ([]levelFile, []string, error) {
 	if len(merged) == 0 {
 		return nil, nil, nil
 	}
 
-	newRuns := make([]levelFile, 0, (len(merged)+l1RunMaxEntries-1)/l1RunMaxEntries)
+	runMax := d.levels[dstLevel].runMaxEntries
+	if runMax <= 0 {
+		runMax = l1RunMaxEntries
+	}
+
+	newRuns := make([]levelFile, 0, (len(merged)+runMax-1)/runMax)
 	created := make([]string, 0, cap(newRuns))
 
 	for i := 0; i < len(merged); {
-		j := i + l1RunMaxEntries
+		j := i + runMax
 		if j > len(merged) {
 			j = len(merged)
 		}
 		chunk := merged[i:j]
 
 		name := fmt.Sprintf("%06d.sst", d.nextID)
-		finalPath := filepath.Join(d.l1Dir, name)
+		finalPath := filepath.Join(d.levels[dstLevel].dir, name)
 		tmpPath := finalPath + ".tmp"
 
 		if err := sstable.WriteTable(tmpPath, chunk); err != nil {
