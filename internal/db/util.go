@@ -1,6 +1,8 @@
 package db
 
 import (
+	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -60,6 +62,45 @@ func scanLevelN(l1Dir string) (files []levelFile, maxID uint64, err error) {
 		return files[i].minKey < files[j].minKey
 	})
 	return files, maxID, nil
+}
+
+func scanAllLevels(sstDir string, opt Options) ([]level, uint64, error) {
+	levels := make([]level, 0, opt.numLevels)
+	var maxID uint64 = 0
+
+	for i := 0; i < opt.numLevels; i++ {
+		ldir := filepath.Join(sstDir, fmt.Sprintf("l%d", i))
+		if err := os.MkdirAll(ldir, 0o755); err != nil {
+			return nil, 0, err
+		}
+
+		lv := level{id: i, dir: ldir}
+
+		if i == 0 {
+			paths, mid, err := scanLevel0(ldir)
+			if err != nil {
+				return nil, 0, err
+			}
+			lv.l0Paths = paths
+			if mid > maxID {
+				maxID = mid
+			}
+		} else {
+			runs, mid, err := scanLevelN(ldir)
+			if err != nil {
+				return nil, 0, err
+			}
+			lv.runs = runs
+			if mid > maxID {
+				maxID = mid
+			}
+		}
+
+		levels = append(levels, lv)
+	}
+
+	nextID := maxID + 1
+	return levels, nextID, nil
 }
 
 func parseSSTID(path string) (uint64, bool) {

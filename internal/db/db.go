@@ -1,10 +1,12 @@
 package db
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
+	"monolithdb/internal/manifest"
 	"monolithdb/internal/memtable"
 	"monolithdb/internal/sstable"
 	"monolithdb/internal/wal"
@@ -30,6 +32,7 @@ type level struct {
 type DB struct {
 	mem *memtable.MemTable
 	wal *wal.WAL
+	man *manifest.Manifest
 
 	dir     string
 	walPath string
@@ -37,7 +40,6 @@ type DB struct {
 
 	levels []level
 	opt    Options
-
 	nextID uint64
 }
 
@@ -59,10 +61,17 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 		return nil, err
 	}
 
+	manPath := filepath.Join(dir, "MANIFEST")
+	man, err := manifest.Open(manPath)
+	if err != nil {
+		return nil, err
+	}
+
 	walPath := filepath.Join(dir, "forge.wal")
 
 	w, err := wal.Open(walPath)
 	if err != nil {
+		_ = man.Close()
 		return nil, err
 	}
 
@@ -72,6 +81,7 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 	records, err := wal.Replay(walPath)
 	if err != nil {
 		_ = w.Close()
+		_ = man.Close()
 		return nil, err
 	}
 	for _, r := range records {
@@ -82,52 +92,35 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 			m.Delete(r.Key)
 		default:
 			_ = w.Close()
+			_ = man.Close()
 			return nil, wal.ErrCorruptWAL
 		}
 	}
 
-	levels := make([]level, 0, opt.numLevels)
-	var maxID uint64 = 0
+	var levels []level
+	var nextID uint64
 
-	for i := 0; i < opt.numLevels; i++ {
-		ldir := filepath.Join(sstDir, fmt.Sprintf("l%d", i))
-		if err := os.MkdirAll(ldir, 0o755); err != nil {
-			_ = w.Close()
-			return nil, err
-		}
-
-		lv := level{id: i, dir: ldir}
-
-		if i == 0 {
-			paths, mid, err := scanLevel0(ldir)
+	levels, nextID, err = recoverFromManifest(manPath, sstDir, opt)
+	if err != nil {
+		// 只有两类错误允许回退：没有 snapshot / manifest 文件不存在
+		if errors.Is(err, manifest.ErrNoSnapshot) || os.IsNotExist(err) {
+			levels, nextID, err = scanAllLevels(sstDir, opt)
 			if err != nil {
 				_ = w.Close()
+				_ = man.Close()
 				return nil, err
-			}
-			lv.l0Paths = paths
-			if mid > maxID {
-				maxID = mid
 			}
 		} else {
-			runs, mid, err := scanLevelN(ldir)
-			if err != nil {
-				_ = w.Close()
-				return nil, err
-			}
-			lv.runs = runs
-			if mid > maxID {
-				maxID = mid
-			}
+			_ = w.Close()
+			_ = man.Close()
+			return nil, err
 		}
-
-		levels = append(levels, lv)
 	}
-
-	nextID := maxID + 1
 
 	return &DB{
 		mem:     m,
 		wal:     w,
+		man:     man,
 		dir:     dir,
 		walPath: walPath,
 		sstDir:  sstDir,
@@ -138,10 +131,17 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 }
 
 func (d *DB) Close() error {
-	if d.wal != nil {
-		return d.wal.Close()
+	var err1, err2 error
+	if d.man != nil {
+		err1 = d.man.Close()
 	}
-	return nil
+	if d.wal != nil {
+		err2 = d.wal.Close()
+	}
+	if err1 != nil {
+		return err1
+	}
+	return err2
 }
 
 func (d *DB) Put(key string, value []byte) error {
