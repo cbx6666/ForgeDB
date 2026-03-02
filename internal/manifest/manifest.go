@@ -55,6 +55,61 @@ func (m *Manifest) WriteSnapshot(next uint64, levels [][]string) error {
 	return m.f.Sync()
 }
 
+// CheckpointLatest rewrites MANIFEST to contain only one latest snapshot.
+// It uses tmp + rename, and then reopens the manifest for further appends.
+func (m *Manifest) CheckpointLatest() error {
+	if m == nil || m.f == nil {
+		return errors.New("manifest: closed")
+	}
+
+	// 1) 从当前文件中读出最后一个 snapshot
+	last, err := LoadLastSnapshot(m.path)
+	if err != nil {
+		return err
+	}
+
+	// 2) 写入 tmp（只写一条）
+	tmp := m.path + ".tmp"
+	tf, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(tf)
+	if err := enc.Encode(last); err != nil {
+		_ = tf.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := tf.Sync(); err != nil {
+		_ = tf.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := tf.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+
+	// 3) 关闭当前 fd，rename 覆盖旧 manifest
+	_ = m.f.Close()
+	m.f = nil
+	m.enc = nil
+
+	if err := os.Rename(tmp, m.path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+
+	// 4) 重新以 append 模式打开，并恢复 encoder
+	f, err := os.OpenFile(m.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	m.f = f
+	m.enc = json.NewEncoder(f)
+	return nil
+}
+
 // LoadLastSnapshot scans MANIFEST and returns the last valid snapshot.
 func LoadLastSnapshot(path string) (*Snapshot, error) {
 	f, err := os.Open(path)
@@ -65,6 +120,7 @@ func LoadLastSnapshot(path string) (*Snapshot, error) {
 
 	var last *Snapshot
 	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1024), 10*1024*1024) // 允许单行最多 10MB
 
 	// sc.Scan() 扫描一行文件
 	for sc.Scan() {

@@ -6,6 +6,17 @@ import (
 	"testing"
 )
 
+func countLinesByNewline(b []byte) int {
+	// json.Encoder.Encode() 每条记录结尾会写 '\n'
+	n := 0
+	for _, c := range b {
+		if c == '\n' {
+			n++
+		}
+	}
+	return n
+}
+
 func TestManifest_WriteAndLoadLastSnapshot(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "MANIFEST")
@@ -107,5 +118,62 @@ func TestLoadLastSnapshot_NoSnapshot(t *testing.T) {
 	_, err := LoadLastSnapshot(path)
 	if err != ErrNoSnapshot {
 		t.Fatalf("err: got %v want %v", err, ErrNoSnapshot)
+	}
+}
+
+func TestManifest_CheckpointLatest_CompactsToOneLineAndCanAppend(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "MANIFEST")
+
+	m, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = m.Close() }()
+
+	// 写多条 snapshot
+	if err := m.WriteSnapshot(1, [][]string{{"a.sst"}}); err != nil {
+		t.Fatalf("WriteSnapshot #1: %v", err)
+	}
+	if err := m.WriteSnapshot(2, [][]string{{"b.sst"}, {"c.sst"}}); err != nil {
+		t.Fatalf("WriteSnapshot #2: %v", err)
+	}
+	if err := m.WriteSnapshot(3, [][]string{{"d.sst"}}); err != nil {
+		t.Fatalf("WriteSnapshot #3: %v", err)
+	}
+
+	// 确认 checkpoint 前确实 >= 3 行（避免测试“没测到”）
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile before: %v", err)
+	}
+	if got := countLinesByNewline(before); got < 3 {
+		t.Fatalf("expected >= 3 lines before checkpoint, got %d", got)
+	}
+
+	// checkpoint：压成只剩最后一条
+	if err := m.CheckpointLatest(); err != nil {
+		t.Fatalf("CheckpointLatest: %v", err)
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile after: %v", err)
+	}
+	if got := countLinesByNewline(after); got != 1 {
+		t.Fatalf("checkpoint did not compact: got %d lines, want 1", got)
+	}
+
+	// 还能继续追加（checkpoint 里必须重开文件）
+	if err := m.WriteSnapshot(4, [][]string{{"e.sst"}}); err != nil {
+		t.Fatalf("WriteSnapshot after checkpoint: %v", err)
+	}
+
+	last, err := LoadLastSnapshot(path)
+	if err != nil {
+		t.Fatalf("LoadLastSnapshot: %v", err)
+	}
+	if last.NextFile != 4 {
+		t.Fatalf("NextFile: got %d want %d", last.NextFile, 4)
 	}
 }
