@@ -110,6 +110,13 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 				_ = man.Close()
 				return nil, err
 			}
+
+			// 第一次启动：用 scan 恢复后，立刻把结构写入 MANIFEST
+			if err := man.WriteSnapshot(nextID, levelsToSnapshot(levels)); err != nil {
+				_ = w.Close()
+				_ = man.Close()
+				return nil, err
+			}
 		} else {
 			_ = w.Close()
 			_ = man.Close()
@@ -240,6 +247,10 @@ func (d *DB) Flush() error {
 	d.levels[0].l0Paths = append([]string{path}, d.levels[0].l0Paths...)
 	d.nextID++
 
+	if err := d.persistManifest(); err != nil {
+		return err
+	}
+
 	// 清空 MemTable
 	d.mem = memtable.NewMemTable()
 
@@ -279,4 +290,11 @@ func (d *DB) Flush() error {
 	}
 
 	return nil
+}
+
+func (d *DB) persistManifest() error {
+	if d.man == nil {
+		return nil
+	}
+	return d.man.WriteSnapshot(d.nextID, levelsToSnapshot(d.levels))
 }

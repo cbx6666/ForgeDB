@@ -147,6 +147,10 @@ func (d *DB) Compact(level int) error {
 	commitSrc()
 	dst.runs = newDst
 
+	if err := d.persistManifest(); err != nil {
+		return err
+	}
+
 	// 10) delete old files
 	for _, p := range oldSrc {
 		_ = os.Remove(p)

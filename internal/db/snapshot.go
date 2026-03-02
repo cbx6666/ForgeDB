@@ -36,11 +36,11 @@ func recoverFromManifest(manPath string, sstDir string, opt Options) ([]level, u
 		paths := snap.Levels[li]
 		runs := make([]levelFile, 0, len(paths))
 		for _, p := range paths {
-			minK, maxK, err := sstKeyRange(p) 
+			minK, maxK, err := sstKeyRange(p)
 			if err != nil {
 				return nil, 0, err
 			}
-			id, _ := parseSSTID(p) 
+			id, _ := parseSSTID(p)
 			runs = append(runs, levelFile{
 				id:     id,
 				path:   p,
@@ -53,4 +53,22 @@ func recoverFromManifest(manPath string, sstDir string, opt Options) ([]level, u
 	}
 
 	return levels, snap.NextFile, nil
+}
+
+func levelsToSnapshot(levels []level) [][]string {
+	out := make([][]string, len(levels))
+	for i := range levels {
+		if i == 0 {
+			// L0: newest-first 的路径列表
+			out[i] = append([]string(nil), levels[i].l0Paths...)
+			continue
+		}
+		// L>=1: runs -> paths（runs 已按 minKey 排序）
+		paths := make([]string, 0, len(levels[i].runs))
+		for _, f := range levels[i].runs {
+			paths = append(paths, f.path)
+		}
+		out[i] = paths
+	}
+	return out
 }
