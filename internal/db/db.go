@@ -32,7 +32,9 @@ type level struct {
 type DB struct {
 	mem *memtable.MemTable
 	wal *wal.WAL
-	man *manifest.Manifest
+
+	man            *manifest.Manifest
+	manifestWrites int
 
 	dir     string
 	walPath string
@@ -296,5 +298,22 @@ func (d *DB) persistManifest() error {
 	if d.man == nil {
 		return nil
 	}
-	return d.man.WriteSnapshot(d.nextID, levelsToSnapshot(d.levels))
+
+	// 1) 追加写入 snapshot
+	if err := d.man.WriteSnapshot(d.nextID, levelsToSnapshot(d.levels)); err != nil {
+		return err
+	}
+
+	// 2) 达到阈值就做一次 checkpoint（压缩重写）
+	d.manifestWrites++
+
+	const checkpointEvery = 50
+	if d.manifestWrites >= checkpointEvery {
+		if err := d.man.CheckpointLatest(); err != nil {
+			return err
+		}
+		d.manifestWrites = 0
+	}
+
+	return nil
 }
