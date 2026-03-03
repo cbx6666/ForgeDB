@@ -126,6 +126,20 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 		}
 	}
 
+	orphan, err := sanityCheckSSTDir(sstDir, levels)
+	if err != nil {
+		_ = w.Close()
+		_ = man.Close()
+		return nil, err
+	}
+	if len(orphan) > 0 {
+		show := orphan
+		if len(show) > 10 {
+			show = show[:10]
+		}
+		fmt.Printf("WARN: db: found orphan sst files (not referenced by manifest): %v (total=%d)\n", show, len(orphan))
+	}
+
 	return &DB{
 		mem:     m,
 		wal:     w,
