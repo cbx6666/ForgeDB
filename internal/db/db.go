@@ -279,6 +279,8 @@ func (d *DB) Delete(key string) error {
 	return nil
 }
 
+// Flush flushes MemTable to a new L0 SST and persists metadata.
+// It does NOT guarantee compaction completion; compaction runs asynchronously.
 func (d *DB) Flush() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()

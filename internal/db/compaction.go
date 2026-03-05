@@ -55,7 +55,7 @@ type compactionResult struct {
 	newRuns []levelFile
 }
 
-func (d *DB) Compact(level int) error {
+func (d *DB) RequestCompaction() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if err := d.checkBGErrLocked(); err != nil {
