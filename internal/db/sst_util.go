@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"monolithdb/internal/sstable"
+	"monolithdb/internal/types"
 )
 
 func scanLevel0(sstDir string) (paths []string, maxID uint64, err error) {
@@ -101,6 +102,40 @@ func scanAllLevels(sstDir string, opt Options) ([]level, uint64, error) {
 
 	nextID := maxID + 1
 	return levels, nextID, nil
+}
+
+func removePaths(all []string, del []string) []string {
+	if len(del) == 0 {
+		return all
+	}
+	set := make(map[string]struct{}, len(del))
+	for _, p := range del {
+		set[p] = struct{}{}
+	}
+	out := make([]string, 0, len(all))
+	for _, p := range all {
+		if _, ok := set[p]; !ok {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func removeRunsByPaths(all []levelFile, del []string) []levelFile {
+	if len(del) == 0 {
+		return all
+	}
+	set := make(map[string]struct{}, len(del))
+	for _, p := range del {
+		set[p] = struct{}{}
+	}
+	out := make([]levelFile, 0, len(all))
+	for _, f := range all {
+		if _, ok := set[f.path]; !ok {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 func parseSSTID(path string) (uint64, bool) {
@@ -226,4 +261,63 @@ func overlappedRuns(files []levelFile, minK, maxK string) (idx []int) {
 		idx = append(idx, i)
 	}
 	return idx
+}
+
+func (d *DB) writeRuns(dstLevel int, merged []types.Entry) ([]levelFile, []string, error) {
+	if len(merged) == 0 {
+		return nil, nil, nil
+	}
+
+	runMax := d.opt.levels[dstLevel].runMaxEntries
+	if runMax <= 0 {
+		return nil, nil, fmt.Errorf("db: invalid runMaxEntries for level %d", dstLevel)
+	}
+	newRuns := make([]levelFile, 0, (len(merged)+runMax-1)/runMax)
+	created := make([]string, 0, cap(newRuns))
+
+	for i := 0; i < len(merged); {
+		j := i + runMax
+		if j > len(merged) {
+			j = len(merged)
+		}
+		chunk := merged[i:j]
+
+		d.mu.Lock()
+		id := d.nextID
+		d.nextID++
+		dstDir := d.levels[dstLevel].dir
+		d.mu.Unlock()
+
+		name := fmt.Sprintf("%06d.sst", id)
+		finalPath := filepath.Join(dstDir, name)
+		tmpPath := finalPath + ".tmp"
+
+		if err := sstable.WriteTable(tmpPath, chunk); err != nil {
+			_ = os.Remove(tmpPath)
+			// 清理已创建的 run
+			for _, p := range created {
+				_ = os.Remove(p)
+			}
+			return nil, nil, err
+		}
+		if err := os.Rename(tmpPath, finalPath); err != nil {
+			_ = os.Remove(tmpPath)
+			for _, p := range created {
+				_ = os.Remove(p)
+			}
+			return nil, nil, err
+		}
+
+		created = append(created, finalPath)
+		newRuns = append(newRuns, levelFile{
+			id:     id,
+			path:   finalPath,
+			minKey: chunk[0].Key,
+			maxKey: chunk[len(chunk)-1].Key,
+		})
+
+		i = j
+	}
+
+	return newRuns, created, nil
 }

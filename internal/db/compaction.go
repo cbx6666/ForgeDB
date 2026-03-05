@@ -2,9 +2,7 @@ package db
 
 import (
 	"container/heap"
-	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 
 	"monolithdb/internal/sstable"
@@ -42,9 +40,34 @@ func (h *mergeHeap) Pop() any {
 	return x
 }
 
+type compactionJob struct {
+	level int
+
+	srcPaths []string
+	dstPaths []string
+
+	minKey string
+	maxKey string
+}
+
+type compactionResult struct {
+	job     *compactionJob
+	newRuns []levelFile
+}
+
 func (d *DB) Compact(level int) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.checkBGErrLocked(); err != nil {
+		return err
+	}
+	d.requestCompactionLocked()
+	return nil
+}
+
+func (d *DB) pickCompactionJobLocked(level int) (*compactionJob, error) {
 	if level < 0 || level+1 >= len(d.levels) {
-		return nil
+		return nil, nil
 	}
 
 	src := &d.levels[level]
@@ -53,115 +76,130 @@ func (d *DB) Compact(level int) error {
 	// src 为空直接返回
 	if level == 0 {
 		if len(src.l0Paths) == 0 {
-			return nil
+			return nil, nil
 		}
 	} else {
 		if len(src.runs) == 0 {
-			return nil
+			return nil, nil
 		}
+	}
+
+	pickN := d.opt.levels[level].pickN
+	if pickN <= 0 {
+		return nil, nil
 	}
 
 	// 1) pick inputs from src
 	var pickedPaths []string
-	commitSrc := func() {}
-	pickN := d.opt.levels[level].pickN
-	if pickN <= 0 {
-		return nil
-	}
-
 	if level == 0 {
-		picked, remain := pickOldestL0(src.l0Paths, pickN)
-		if len(picked) == 0 {
-			return nil
-		}
+		picked, _ := pickOldestL0(src.l0Paths, pickN)
 		pickedPaths = picked
-		commitSrc = func() { src.l0Paths = remain }
 	} else {
-		pickedRuns, remainRuns := pickOldestRuns(src.runs, pickN)
-		if len(pickedRuns) == 0 {
-			return nil
-		}
+		pickedRuns, _ := pickOldestRuns(src.runs, pickN)
 		for _, f := range pickedRuns {
 			pickedPaths = append(pickedPaths, f.path)
 		}
-		commitSrc = func() { src.runs = remainRuns }
+	}
+	if len(pickedPaths) == 0 {
+		return nil, nil
 	}
 
 	// 2) range of picked
 	minK, maxK, err := rangeOfFiles(pickedPaths)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// 3) overlap in dst (dst 是 L>=1 runs)
+	// 3) overlap in dst (基于当前 dst.runs)
 	overIdx := overlappedRuns(dst.runs, minK, maxK)
-
-	// 4) build inputs: pickedPaths first, overlapped dst after
-	inputs := make([]string, 0, len(pickedPaths)+len(overIdx))
-	inputs = append(inputs, pickedPaths...)
+	dstPaths := make([]string, 0, len(overIdx))
 	for _, i := range overIdx {
-		inputs = append(inputs, dst.runs[i].path)
+		dstPaths = append(dstPaths, dst.runs[i].path)
 	}
 
-	// 5) heap merge
+	return &compactionJob{
+		level:    level,
+		srcPaths: append([]string(nil), pickedPaths...),
+		dstPaths: dstPaths,
+		minKey:   minK,
+		maxKey:   maxK,
+	}, nil
+}
+
+func (d *DB) doCompaction(job *compactionJob) (*compactionResult, error) {
+	inputs := make([]string, 0, len(job.srcPaths)+len(job.dstPaths))
+	inputs = append(inputs, job.srcPaths...)
+	inputs = append(inputs, job.dstPaths...)
+
 	merged, err := mergeIters(inputs)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(merged) == 0 {
-		return nil
+		return &compactionResult{job: job, newRuns: nil}, nil
 	}
 
-	// 6) writeRuns(level+1)
-	newRuns, _, err := d.writeRuns(level+1, merged)
+	newRuns, _, err := d.writeRuns(job.level+1, merged)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if len(newRuns) == 0 {
+	return &compactionResult{job: job, newRuns: newRuns}, nil
+}
+
+func (d *DB) installCompactionLocked(res *compactionResult) error {
+	job := res.job
+	level := job.level
+	if level < 0 || level+1 >= len(d.levels) {
 		return nil
 	}
 
-	// 7) replace overlap in dst
-	newDst := make([]levelFile, 0, len(dst.runs)-len(overIdx)+len(newRuns))
+	src := &d.levels[level]
+	dst := &d.levels[level+1]
+
+	// 1) 从 src 移除 job.srcPaths
+	if level == 0 {
+		src.l0Paths = removePaths(src.l0Paths, job.srcPaths)
+	} else {
+		src.runs = removeRunsByPaths(src.runs, job.srcPaths)
+	}
+
+	// 2) 重新算 overlap（用 job.minKey/maxKey，而不是用旧的 dstPaths 快照）
+	overIdx := overlappedRuns(dst.runs, job.minKey, job.maxKey)
+	realOldDst := make([]string, 0, len(overIdx))
+	for _, i := range overIdx {
+		realOldDst = append(realOldDst, dst.runs[i].path)
+	}
+
+	// 3) 替换 dst 的 overlap 区间
+	newDst := make([]levelFile, 0, len(dst.runs)-len(overIdx)+len(res.newRuns))
 	if len(overIdx) == 0 {
 		newDst = append(newDst, dst.runs...)
-		newDst = append(newDst, newRuns...)
+		newDst = append(newDst, res.newRuns...)
 		sort.Slice(newDst, func(i, j int) bool { return newDst[i].minKey < newDst[j].minKey })
 	} else {
 		start := overIdx[0]
 		end := overIdx[len(overIdx)-1] + 1
 		newDst = append(newDst, dst.runs[:start]...)
-		newDst = append(newDst, newRuns...)
+		newDst = append(newDst, res.newRuns...)
 		newDst = append(newDst, dst.runs[end:]...)
 	}
-
-	// 8) collect old files to delete (MUST before install)
-	oldSrc := append([]string(nil), pickedPaths...)
-
-	oldDst := make([]string, 0, len(overIdx))
-	for _, i := range overIdx {
-		oldDst = append(oldDst, dst.runs[i].path)
-	}
-
-	// 9) install metadata (atomic in-memory install)
-	commitSrc()
 	dst.runs = newDst
 
+	// 4) persist manifest
 	if err := d.persistManifest(); err != nil {
 		return err
 	}
 
-	// 10) delete old files
-	for _, p := range oldSrc {
+	// 5) 删除旧文件：srcPaths + realOldDst
+	for _, p := range job.srcPaths {
 		_ = os.Remove(p)
 	}
-	for _, p := range oldDst {
+	for _, p := range realOldDst {
 		_ = os.Remove(p)
 	}
 
 	return nil
 }
-
 func mergeIters(paths []string) ([]types.Entry, error) {
 	h := &mergeHeap{}
 	heap.Init(h)
@@ -210,56 +248,24 @@ func mergeIters(paths []string) ([]types.Entry, error) {
 	return merged, nil
 }
 
-func (d *DB) writeRuns(dstLevel int, merged []types.Entry) ([]levelFile, []string, error) {
-	if len(merged) == 0 {
-		return nil, nil, nil
-	}
-
-	runMax := d.opt.levels[dstLevel].runMaxEntries
-	if runMax <= 0 {
-		return nil, nil, fmt.Errorf("db: invalid runMaxEntries for level %d", dstLevel)
-	}
-	newRuns := make([]levelFile, 0, (len(merged)+runMax-1)/runMax)
-	created := make([]string, 0, cap(newRuns))
-
-	for i := 0; i < len(merged); {
-		j := i + runMax
-		if j > len(merged) {
-			j = len(merged)
-		}
-		chunk := merged[i:j]
-
-		name := fmt.Sprintf("%06d.sst", d.nextID)
-		finalPath := filepath.Join(d.levels[dstLevel].dir, name)
-		tmpPath := finalPath + ".tmp"
-
-		if err := sstable.WriteTable(tmpPath, chunk); err != nil {
-			_ = os.Remove(tmpPath)
-			// 清理已创建的 run
-			for _, p := range created {
-				_ = os.Remove(p)
-			}
-			return nil, nil, err
-		}
-		if err := os.Rename(tmpPath, finalPath); err != nil {
-			_ = os.Remove(tmpPath)
-			for _, p := range created {
-				_ = os.Remove(p)
-			}
-			return nil, nil, err
+func (d *DB) pickCompactionLevelLocked() (int, bool) {
+	// 从低层往高层找第一个超阈值的
+	for level := 0; level < len(d.levels)-1; level++ {
+		maxFiles := d.opt.levels[level].maxFiles
+		if maxFiles <= 0 {
+			continue
 		}
 
-		created = append(created, finalPath)
-		newRuns = append(newRuns, levelFile{
-			id:     d.nextID,
-			path:   finalPath,
-			minKey: chunk[0].Key,
-			maxKey: chunk[len(chunk)-1].Key,
-		})
+		over := false
+		if level == 0 {
+			over = len(d.levels[level].l0Paths) > maxFiles
+		} else {
+			over = len(d.levels[level].runs) > maxFiles
+		}
 
-		d.nextID++
-		i = j
+		if over {
+			return level, true
+		}
 	}
-
-	return newRuns, created, nil
+	return 0, false
 }
