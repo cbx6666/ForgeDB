@@ -32,14 +32,16 @@ type level struct {
 
 type DB struct {
 	mem *memtable.MemTable
+	imm *memtable.MemTable
 	wal *wal.WAL
 
 	man            *manifest.Manifest
 	manifestWrites int
 
-	dir     string
-	walPath string
-	sstDir  string
+	dir        string
+	walPath    string
+	immWalPath string // 冻结 memtable 对应的 WAL 文件路径
+	sstDir     string
 
 	levels []level
 	opt    Options
@@ -81,6 +83,7 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 	}
 
 	walPath := filepath.Join(dir, "forge.wal")
+	immWalPath := filepath.Join(dir, "forge.flush.wal")
 
 	w, err := wal.Open(walPath)
 	if err != nil {
@@ -91,23 +94,36 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 	m := memtable.NewMemTable()
 
 	// 回放 WAL：把操作重新应用到 MemTable
-	records, err := wal.Replay(walPath)
-	if err != nil {
+	replayInto := func(path string, m *memtable.MemTable) error {
+		records, err := wal.Replay(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		for _, r := range records {
+			switch r.Op {
+			case 0:
+				m.Put(r.Key, r.Value)
+			case 1:
+				m.Delete(r.Key)
+			default:
+				return wal.ErrCorruptWAL
+			}
+		}
+		return nil
+	}
+
+	if err := replayInto(immWalPath, m); err != nil {
 		_ = w.Close()
 		_ = man.Close()
 		return nil, err
 	}
-	for _, r := range records {
-		switch r.Op {
-		case 0:
-			m.Put(r.Key, r.Value)
-		case 1:
-			m.Delete(r.Key)
-		default:
-			_ = w.Close()
-			_ = man.Close()
-			return nil, wal.ErrCorruptWAL
-		}
+	if err := replayInto(walPath, m); err != nil {
+		_ = w.Close()
+		_ = man.Close()
+		return nil, err
 	}
 
 	var levels []level
@@ -152,15 +168,16 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 	}
 
 	db := &DB{
-		mem:     m,
-		wal:     w,
-		man:     man,
-		dir:     dir,
-		walPath: walPath,
-		sstDir:  sstDir,
-		levels:  levels,
-		opt:     opt,
-		nextID:  nextID,
+		mem:        m,
+		wal:        w,
+		man:        man,
+		dir:        dir,
+		walPath:    walPath,
+		immWalPath: immWalPath,
+		sstDir:     sstDir,
+		levels:     levels,
+		opt:        opt,
+		nextID:     nextID,
 	}
 	db.cond = sync.NewCond(&db.mu)
 	db.wg.Add(1) // 准确覆盖协程的整个生命周期
@@ -221,7 +238,17 @@ func (d *DB) Get(key string) ([]byte, bool, error) {
 		return e.Value, true, nil
 	}
 
-	// 2) Levels
+	// 2) immutable MemTable (flush in progress)
+	if d.imm != nil {
+		if e, ok := d.imm.GetAll(key); ok {
+			if e.Tombstone {
+				return nil, false, nil
+			}
+			return e.Value, true, nil
+		}
+	}
+
+	// 3) Levels
 	for li := 0; li < len(d.levels); li++ {
 		lv := &d.levels[li]
 
@@ -279,63 +306,40 @@ func (d *DB) Delete(key string) error {
 	return nil
 }
 
-// Flush flushes MemTable to a new L0 SST and persists metadata.
+// Flush flushes current MemTable to a new L0 SST.
+// It rotates active memtable/WAL first so foreground writes can continue.
 // It does NOT guarantee compaction completion; compaction runs asynchronously.
 func (d *DB) Flush() error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if err := d.checkBGErrLocked(); err != nil {
+		d.mu.Unlock()
 		return err
 	}
 
-	entries := d.mem.RangeAll("", "")
-	if len(entries) == 0 {
-		return nil
-	}
-
-	// 生成新 SSTable 文件名
-	name := fmt.Sprintf("%06d.sst", d.nextID)
-	path := filepath.Join(d.levels[0].dir, name)
-
-	// 先写到临时文件，再 rename，避免写一半崩溃留下半成品
-	tmp := path + ".tmp"
-	if err := sstable.WriteTable(tmp, entries); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-
-	// 把新表放到列表最前面
-	d.levels[0].l0Paths = append([]string{path}, d.levels[0].l0Paths...)
-	d.nextID++
-
-	if err := d.persistManifest(); err != nil {
-		return err
-	}
-
-	// 清空 MemTable
-	d.mem = memtable.NewMemTable()
-
-	// 截断 WAL：否则重启 Replay 会重复应用旧操作
-	if err := d.wal.Close(); err != nil {
-		return err
-	}
-	// 直接把 wal 文件清空
-	if err := os.WriteFile(d.walPath, nil, 0o644); err != nil {
-		return err
-	}
-	w, err := wal.Open(d.walPath)
+	job, err := d.prepareFlushLocked()
+	d.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	d.wal = w
+	if job == nil {
+		return nil
+	}
 
-	// wake bg compaction
-	d.requestCompactionLocked()
+	// slow IO out of lock
+	if err := d.doFlush(job); err != nil {
+		d.mu.Lock()
+		d.bgErr = err
+		d.mu.Unlock()
+		return err
+	}
 
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if err := d.installFlushLocked(job); err != nil {
+		d.bgErr = err
+		return err
+	}
 	return nil
 }
 
