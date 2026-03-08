@@ -191,39 +191,58 @@ func rangeOfFiles(paths []string) (minK, maxK string, err error) {
 	return minK, maxK, nil
 }
 
-func pickOldestL0(l0 []string, n int) (picked, remain []string) {
-	if len(l0) <= n {
-		return l0, nil
+func pickOldestL0(l0 []string, n int, skip func(string) bool) (picked, remain []string) {
+	remain = make([]string, 0, len(l0))
+	picked = make([]string, 0, n)
+
+	remain = append(remain, l0...)
+
+	for i := len(l0) - 1; i >= 0 && len(picked) < n; i-- {
+		p := l0[i]
+		if skip != nil && skip(p) {
+			continue
+		}
+		picked = append(picked, p)
 	}
-	picked = append([]string(nil), l0[len(l0)-n:]...)
-	remain = append([]string(nil), l0[:len(l0)-n]...)
-	return picked, remain
+
+	if len(picked) == 0 {
+		return nil, remain
+	}
+	set := make(map[string]struct{}, len(picked))
+	for _, p := range picked {
+		set[p] = struct{}{}
+	}
+	out := make([]string, 0, len(remain)-len(picked))
+	for _, p := range remain {
+		if _, ok := set[p]; !ok {
+			out = append(out, p)
+		}
+	}
+	remain = out
+	return
 }
 
-func pickOldestRuns(files []levelFile, n int) (picked, remain []levelFile) {
-	if len(files) <= n {
-		return append([]levelFile(nil), files...), nil
-	}
-
-	// 找 id 最小的 n 个
-	idx := make([]int, len(files))
+func pickOldestRuns(files []levelFile, n int, skip func(string) bool) (picked, remain []levelFile) {
+	idx := make([]int, 0, len(files))
 	for i := range files {
-		idx[i] = i
+		idx = append(idx, i)
 	}
-
-	sort.Slice(idx, func(i, j int) bool {
-		return files[idx[i]].id < files[idx[j]].id
-	})
+	sort.Slice(idx, func(i, j int) bool { return files[idx[i]].id < files[idx[j]].id })
 
 	pickedSet := make(map[int]struct{}, n)
-	for i := 0; i < n; i++ {
-		pickedSet[idx[i]] = struct{}{}
+	for _, i := range idx {
+		if len(pickedSet) >= n {
+			break
+		}
+		p := files[i].path
+		if skip != nil && skip(p) {
+			continue
+		}
+		pickedSet[i] = struct{}{}
 	}
 
-	picked = make([]levelFile, 0, n)
-	remain = make([]levelFile, 0, len(files)-n)
-
-	// 保留文件原始顺序
+	picked = make([]levelFile, 0, len(pickedSet))
+	remain = make([]levelFile, 0, len(files)-len(pickedSet))
 	for i, f := range files {
 		if _, ok := pickedSet[i]; ok {
 			picked = append(picked, f)

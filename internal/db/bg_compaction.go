@@ -64,6 +64,7 @@ func (d *DB) compactionLoop() {
 			res, err := d.doCompaction(job)
 			if err != nil {
 				d.mu.Lock()
+				d.clearJobPendingLocked(job)
 				d.bgErr = err
 				d.compacting = false
 				d.mu.Unlock()
@@ -73,6 +74,7 @@ func (d *DB) compactionLoop() {
 			// --- install (locked, short) ---
 			d.mu.Lock()
 			if err := d.installCompactionLocked(res); err != nil {
+				d.clearJobPendingLocked(job)
 				d.bgErr = err
 				d.compacting = false
 				d.mu.Unlock()
@@ -94,4 +96,14 @@ func (d *DB) checkBGErrLocked() error {
 		return d.bgErr
 	}
 	return nil
+}
+
+func (d *DB) clearJobPendingLocked(job *compactionJob) {
+	if job == nil {
+		return
+	}
+	all := make([]string, 0, len(job.srcPaths)+len(job.dstPaths))
+	all = append(all, job.srcPaths...)
+	all = append(all, job.dstPaths...)
+	d.clearPendingLocked(all)
 }

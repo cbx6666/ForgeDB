@@ -92,10 +92,10 @@ func (d *DB) pickCompactionJobLocked(level int) (*compactionJob, error) {
 	// 1) pick inputs from src
 	var pickedPaths []string
 	if level == 0 {
-		picked, _ := pickOldestL0(src.l0Paths, pickN)
+		picked, _ := pickOldestL0(src.l0Paths, pickN, d.isPendingLocked)
 		pickedPaths = picked
 	} else {
-		pickedRuns, _ := pickOldestRuns(src.runs, pickN)
+		pickedRuns, _ := pickOldestRuns(src.runs, pickN, d.isPendingLocked)
 		for _, f := range pickedRuns {
 			pickedPaths = append(pickedPaths, f.path)
 		}
@@ -114,8 +114,19 @@ func (d *DB) pickCompactionJobLocked(level int) (*compactionJob, error) {
 	overIdx := overlappedRuns(dst.runs, minK, maxK)
 	dstPaths := make([]string, 0, len(overIdx))
 	for _, i := range overIdx {
-		dstPaths = append(dstPaths, dst.runs[i].path)
+		p := dst.runs[i].path
+		if d.isPendingLocked(p) {
+			return nil, nil
+		}
+
+		dstPaths = append(dstPaths, p)
 	}
+
+	// 4) 标记 pending
+	all := make([]string, 0, len(pickedPaths)+len(dstPaths))
+	all = append(all, pickedPaths...)
+	all = append(all, dstPaths...)
+	d.markPendingLocked(all)
 
 	return &compactionJob{
 		level:    level,
@@ -198,6 +209,12 @@ func (d *DB) installCompactionLocked(res *compactionResult) error {
 		_ = os.Remove(p)
 	}
 
+	// 6) 删除标记
+	all := make([]string, 0, len(job.srcPaths)+len(realOldDst))
+	all = append(all, job.srcPaths...)
+	all = append(all, realOldDst...)
+	d.clearPendingLocked(all)
+
 	return nil
 }
 func mergeIters(paths []string) ([]types.Entry, error) {
@@ -268,4 +285,21 @@ func (d *DB) pickCompactionLevelLocked() (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+func (d *DB) isPendingLocked(path string) bool {
+	_, ok := d.pending[path]
+	return ok
+}
+
+func (d *DB) markPendingLocked(paths []string) {
+	for _, p := range paths {
+		d.pending[p] = struct{}{}
+	}
+}
+
+func (d *DB) clearPendingLocked(paths []string) {
+	for _, p := range paths {
+		delete(d.pending, p)
+	}
 }

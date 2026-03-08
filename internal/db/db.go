@@ -56,6 +56,7 @@ type DB struct {
 	compactionReq bool
 	compacting    bool
 	bgErr         error
+	pending       map[string]struct{} // path -> pending
 }
 
 func Open(dir string) (*DB, error) {
@@ -178,6 +179,7 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 		levels:     levels,
 		opt:        opt,
 		nextID:     nextID,
+		pending:    make(map[string]struct{}),
 	}
 	db.cond = sync.NewCond(&db.mu)
 	db.wg.Add(1) // 准确覆盖协程的整个生命周期
