@@ -57,15 +57,18 @@ type levelSnapshot struct {
 func snapshotLevels(d *DB) levelSnapshot {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	levels := d.currentVersion().levels
+
 	s := levelSnapshot{}
-	if len(d.levels) > 0 {
-		s.l0 = len(d.levels[0].l0Paths)
+	if len(levels) > 0 {
+		s.l0 = len(levels[0].l0Paths)
 	}
-	if len(d.levels) > 1 {
-		s.l1 = len(d.levels[1].runs)
+	if len(levels) > 1 {
+		s.l1 = len(levels[1].runs)
 	}
-	if len(d.levels) > 2 {
-		s.l2 = len(d.levels[2].runs)
+	if len(levels) > 2 {
+		s.l2 = len(levels[2].runs)
 	}
 	return s
 }
@@ -74,10 +77,13 @@ func assertInvariantsLocked(t *testing.T, d *DB) {
 	t.Helper()
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	levels := d.currentVersion().levels
+
 	// L0 允许 overlap，不检查
-	for level := 1; level < len(d.levels); level++ {
-		if len(d.levels[level].runs) > 0 {
-			assertRunsSortedNoOverlap(t, d.levels[level].runs)
+	for level := 1; level < len(levels); level++ {
+		if len(levels[level].runs) > 0 {
+			assertRunsSortedNoOverlap(t, levels[level].runs)
 		}
 	}
 }

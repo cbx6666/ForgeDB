@@ -66,12 +66,13 @@ func (d *DB) RequestCompaction() error {
 }
 
 func (d *DB) pickCompactionJobLocked(level int) (*compactionJob, error) {
-	if level < 0 || level+1 >= len(d.levels) {
+	v := d.currentVersion()
+	if level < 0 || level+1 >= len(v.levels) {
 		return nil, nil
 	}
 
-	src := &d.levels[level]
-	dst := &d.levels[level+1]
+	src := &v.levels[level]
+	dst := &v.levels[level+1]
 
 	// src 为空直接返回
 	if level == 0 {
@@ -160,12 +161,16 @@ func (d *DB) doCompaction(job *compactionJob) (*compactionResult, error) {
 func (d *DB) installCompactionLocked(res *compactionResult) error {
 	job := res.job
 	level := job.level
-	if level < 0 || level+1 >= len(d.levels) {
+
+	oldv := d.currentVersion()
+	if level < 0 || level+1 >= len(oldv.levels) {
 		return nil
 	}
 
-	src := &d.levels[level]
-	dst := &d.levels[level+1]
+	newv := oldv.withLevels()
+
+	src := &newv.levels[level]
+	dst := &newv.levels[level+1]
 
 	// 1) 从 src 移除 job.srcPaths
 	if level == 0 {
@@ -197,9 +202,11 @@ func (d *DB) installCompactionLocked(res *compactionResult) error {
 	dst.runs = newDst
 
 	// 4) persist manifest
-	if err := d.persistManifest(); err != nil {
+	if err := d.persistManifestLevels(newv.levels); err != nil {
 		return err
 	}
+
+	d.current = newv
 
 	// 5) 删除旧文件：srcPaths + realOldDst
 	for _, p := range job.srcPaths {
@@ -217,6 +224,7 @@ func (d *DB) installCompactionLocked(res *compactionResult) error {
 
 	return nil
 }
+
 func mergeIters(paths []string) ([]types.Entry, error) {
 	h := &mergeHeap{}
 	heap.Init(h)
@@ -266,8 +274,10 @@ func mergeIters(paths []string) ([]types.Entry, error) {
 }
 
 func (d *DB) pickCompactionLevelLocked() (int, bool) {
+	v := d.currentVersion()
+
 	// 从低层往高层找第一个超阈值的
-	for level := 0; level < len(d.levels)-1; level++ {
+	for level := 0; level < len(v.levels)-1; level++ {
 		maxFiles := d.opt.levels[level].maxFiles
 		if maxFiles <= 0 {
 			continue
@@ -275,9 +285,9 @@ func (d *DB) pickCompactionLevelLocked() (int, bool) {
 
 		over := false
 		if level == 0 {
-			over = len(d.levels[level].l0Paths) > maxFiles
+			over = len(v.levels[level].l0Paths) > maxFiles
 		} else {
-			over = len(d.levels[level].runs) > maxFiles
+			over = len(v.levels[level].runs) > maxFiles
 		}
 
 		if over {

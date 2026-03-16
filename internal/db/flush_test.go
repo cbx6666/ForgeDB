@@ -21,14 +21,16 @@ func snapshotFlushStateLocked(d *DB) flushState {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	levels := d.currentVersion().levels
+
 	s := flushState{
 		immNil: d.imm == nil,
 		memNil: d.mem == nil,
 		wal:    d.walPath,
 		immWAL: d.immWalPath,
 	}
-	if len(d.levels) > 0 {
-		s.l0Count = len(d.levels[0].l0Paths)
+	if len(levels) > 0 {
+		s.l0Count = len(levels[0].l0Paths)
 	}
 	return s
 }
@@ -67,6 +69,8 @@ func TestDB_FlushPrepare_RotatesMemAndWAL(t *testing.T) {
 		t.Fatal("prepareFlushLocked returned nil job")
 	}
 
+	levels := d.currentVersion().levels
+
 	// 1) imm 必须非空
 	if d.imm == nil {
 		d.mu.Unlock()
@@ -83,10 +87,10 @@ func TestDB_FlushPrepare_RotatesMemAndWAL(t *testing.T) {
 		t.Fatal("expected old NOT in active mem after prepareFlushLocked")
 	}
 	// 4) prepare 后 L0 还没安装新表
-	if len(d.levels) == 0 || len(d.levels[0].l0Paths) != 0 {
+	if len(levels) == 0 || len(levels[0].l0Paths) != 0 {
 		got := 0
-		if len(d.levels) > 0 {
-			got = len(d.levels[0].l0Paths)
+		if len(levels) > 0 {
+			got = len(levels[0].l0Paths)
 		}
 		d.mu.Unlock()
 		t.Fatalf("expected L0 unchanged before install, got L0=%d", got)
@@ -183,15 +187,17 @@ func TestDB_Flush_ForegroundWritesDuringFlushAndInstallCleansUp(t *testing.T) {
 
 	// install（锁内）
 	d.mu.Lock()
+	levelsBefore := d.currentVersion().levels
 	l0Before := 0
-	if len(d.levels) > 0 {
-		l0Before = len(d.levels[0].l0Paths)
+	if len(levelsBefore) > 0 {
+		l0Before = len(levelsBefore[0].l0Paths)
 	}
 	err = d.installFlushLocked(job)
 	immNil := (d.imm == nil)
+	levelsAfter := d.currentVersion().levels
 	l0After := 0
-	if len(d.levels) > 0 {
-		l0After = len(d.levels[0].l0Paths)
+	if len(levelsAfter) > 0 {
+		l0After = len(levelsAfter[0].l0Paths)
 	}
 	d.mu.Unlock()
 
@@ -415,10 +421,11 @@ func TestDB_Flush_FileLayout_NoTmpLeft(t *testing.T) {
 
 	// L0 应包含该文件路径（newest-first，放在头部）
 	d.mu.Lock()
-	if len(d.levels) == 0 || len(d.levels[0].l0Paths) == 0 || d.levels[0].l0Paths[0] != job.path {
+	levels := d.currentVersion().levels
+	if len(levels) == 0 || len(levels[0].l0Paths) == 0 || levels[0].l0Paths[0] != job.path {
 		got := ""
-		if len(d.levels) > 0 && len(d.levels[0].l0Paths) > 0 {
-			got = d.levels[0].l0Paths[0]
+		if len(levels) > 0 && len(levels[0].l0Paths) > 0 {
+			got = levels[0].l0Paths[0]
 		}
 		d.mu.Unlock()
 		t.Fatalf("expected L0[0]==job.path, got %q want %q", got, job.path)

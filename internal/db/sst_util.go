@@ -304,7 +304,7 @@ func (d *DB) writeRuns(dstLevel int, merged []types.Entry) ([]levelFile, []strin
 		d.mu.Lock()
 		id := d.nextID
 		d.nextID++
-		dstDir := d.levels[dstLevel].dir
+		dstDir := d.currentVersion().levels[dstLevel].dir
 		d.mu.Unlock()
 
 		name := fmt.Sprintf("%06d.sst", id)

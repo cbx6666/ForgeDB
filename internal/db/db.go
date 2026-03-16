@@ -43,9 +43,9 @@ type DB struct {
 	immWalPath string // 冻结 memtable 对应的 WAL 文件路径
 	sstDir     string
 
-	levels []level
-	opt    Options
-	nextID uint64
+	current *Version
+	opt     Options
+	nextID  uint64
 
 	// bg compaction
 	mu   sync.Mutex
@@ -176,7 +176,7 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 		walPath:    walPath,
 		immWalPath: immWalPath,
 		sstDir:     sstDir,
-		levels:     levels,
+		current:    newVersionFromLevels(levels),
 		opt:        opt,
 		nextID:     nextID,
 		pending:    make(map[string]struct{}),
@@ -232,6 +232,9 @@ func (d *DB) Get(key string) ([]byte, bool, error) {
 		return nil, false, err
 	}
 
+	v := d.currentVersion()
+	levels := v.levels
+
 	// 1) MemTable
 	if e, ok := d.mem.GetAll(key); ok {
 		if e.Tombstone {
@@ -251,8 +254,8 @@ func (d *DB) Get(key string) ([]byte, bool, error) {
 	}
 
 	// 3) Levels
-	for li := 0; li < len(d.levels); li++ {
-		lv := &d.levels[li]
+	for li := 0; li < len(levels); li++ {
+		lv := &levels[li]
 
 		if li == 0 {
 			// L0 newest-first
@@ -345,13 +348,13 @@ func (d *DB) Flush() error {
 	return nil
 }
 
-func (d *DB) persistManifest() error {
+func (d *DB) persistManifestLevels(levels []level) error {
 	if d.man == nil {
 		return nil
 	}
 
 	// 1) 追加写入 snapshot
-	if err := d.man.WriteSnapshot(d.nextID, levelsToSnapshot(d.levels)); err != nil {
+	if err := d.man.WriteSnapshot(d.nextID, levelsToSnapshot(levels)); err != nil {
 		return err
 	}
 
@@ -367,4 +370,19 @@ func (d *DB) persistManifest() error {
 	}
 
 	return nil
+}
+
+func (d *DB) persistManifest() error {
+	return d.persistManifestLevels(d.currentLevels())
+}
+
+func (d *DB) currentVersion() *Version {
+	if d.current == nil {
+		return &Version{}
+	}
+	return d.current
+}
+
+func (d *DB) currentLevels() []level {
+	return d.currentVersion().levels
 }

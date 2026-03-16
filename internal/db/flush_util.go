@@ -29,7 +29,8 @@ func (d *DB) prepareFlushLocked() (*flushJob, error) {
 	}
 
 	id := d.nextID
-	path := filepath.Join(d.levels[0].dir, fmt.Sprintf("%06d.sst", id))
+	v := d.currentVersion()
+	path := filepath.Join(v.levels[0].dir, fmt.Sprintf("%06d.sst", id))
 	tmpPath := path + ".tmp"
 
 	// 1) freeze current memtable
@@ -94,13 +95,18 @@ func (d *DB) doFlush(job *flushJob) error {
 }
 
 func (d *DB) installFlushLocked(job *flushJob) error {
+	oldv := d.currentVersion()
+	newv := oldv.withLevels()
+
 	// 挂到 L0 头部
-	d.levels[0].l0Paths = append([]string{job.path}, d.levels[0].l0Paths...)
+	newv.levels[0].l0Paths = append([]string{job.path}, newv.levels[0].l0Paths...)
 	d.nextID++
 
-	if err := d.persistManifest(); err != nil {
+	if err := d.persistManifestLevels(newv.levels); err != nil {
 		return err
 	}
+
+	d.current = newv
 
 	// flush 成功，冻结 mem / flush wal 可以清理掉
 	d.imm = nil
