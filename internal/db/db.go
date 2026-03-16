@@ -373,7 +373,7 @@ func (d *DB) persistManifestLevels(levels []level) error {
 }
 
 func (d *DB) persistManifest() error {
-	return d.persistManifestLevels(d.currentLevels())
+	return d.persistManifestLevels(d.currentVersion().levels)
 }
 
 func (d *DB) currentVersion() *Version {
@@ -381,8 +381,4 @@ func (d *DB) currentVersion() *Version {
 		return &Version{}
 	}
 	return d.current
-}
-
-func (d *DB) currentLevels() []level {
-	return d.currentVersion().levels
 }
