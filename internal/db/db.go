@@ -59,6 +59,10 @@ type DB struct {
 	pending       map[string]struct{} // path -> pending
 }
 
+type readView struct {
+	version *Version
+}
+
 func Open(dir string) (*DB, error) {
 	return OpenWithOptions(dir, defaultOptions())
 }
@@ -227,16 +231,14 @@ func (d *DB) Put(key string, value []byte) error {
 
 func (d *DB) Get(key string) ([]byte, bool, error) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if err := d.checkBGErrLocked(); err != nil {
+		d.mu.Unlock()
 		return nil, false, err
 	}
 
-	v := d.currentVersion()
-	levels := v.levels
-
 	// 1) MemTable
 	if e, ok := d.mem.GetAll(key); ok {
+		d.mu.Unlock()
 		if e.Tombstone {
 			return nil, false, nil
 		}
@@ -246,6 +248,7 @@ func (d *DB) Get(key string) ([]byte, bool, error) {
 	// 2) immutable MemTable (flush in progress)
 	if d.imm != nil {
 		if e, ok := d.imm.GetAll(key); ok {
+			d.mu.Unlock()
 			if e.Tombstone {
 				return nil, false, nil
 			}
@@ -253,7 +256,15 @@ func (d *DB) Get(key string) ([]byte, bool, error) {
 		}
 	}
 
-	// 3) Levels
+	// 3) 抓取当前 Version，后续锁外查 SST
+	view := readView{
+		version: d.currentVersion(),
+	}
+	d.mu.Unlock()
+
+	levels := view.version.levels
+
+	// 4) Levels
 	for li := 0; li < len(levels); li++ {
 		lv := &levels[li]
 
@@ -370,10 +381,6 @@ func (d *DB) persistManifestLevels(levels []level) error {
 	}
 
 	return nil
-}
-
-func (d *DB) persistManifest() error {
-	return d.persistManifestLevels(d.currentVersion().levels)
 }
 
 func (d *DB) currentVersion() *Version {
