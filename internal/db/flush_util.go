@@ -23,8 +23,7 @@ func (d *DB) prepareFlushLocked() (*flushJob, error) {
 		return nil, fmt.Errorf("db: flush already in progress")
 	}
 
-	entries := d.mem.RangeAll("", "")
-	if len(entries) == 0 {
+	if d.mem == nil || d.mem.ApproxSize() == 0 {
 		return nil, nil
 	}
 
@@ -75,7 +74,6 @@ func (d *DB) prepareFlushLocked() (*flushJob, error) {
 	d.wal = newWal
 
 	return &flushJob{
-		entries: entries,
 		id:      id,
 		path:    path,
 		tmpPath: tmpPath,
@@ -83,6 +81,17 @@ func (d *DB) prepareFlushLocked() (*flushJob, error) {
 }
 
 func (d *DB) doFlush(job *flushJob) error {
+	if job == nil {
+		return nil
+	}
+	if d.imm == nil {
+		return fmt.Errorf("db: no immutable memtable to flush")
+	}
+	job.entries = d.imm.RangeAll("", "")
+	if len(job.entries) == 0 {
+		return fmt.Errorf("db: flush job has no entries")
+	}
+
 	if err := sstable.WriteTable(job.tmpPath, job.entries); err != nil {
 		_ = os.Remove(job.tmpPath)
 		return err
