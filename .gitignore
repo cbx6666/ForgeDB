@@ -1,0 +1,8 @@
+# 本地演示数据库目录
+/demo-data/
+/tmp-demo-check/
+
+# 手工测试时常用的临时数据库目录
+/tmp/
+/tmp-*/
+
