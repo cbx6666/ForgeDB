@@ -186,3 +186,98 @@ func TestDBConcurrentPuts(t *testing.T) {
 		}
 	}
 }
+
+func TestDBWriteBatch_AppliesAllOperations(t *testing.T) {
+	dir := t.TempDir()
+	dbDir := filepath.Join(dir, "data")
+
+	d, err := Open(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+
+	if err := d.Put("stale", []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+
+	var batch WriteBatch
+	batch.Put("a", []byte("1"))
+	batch.Put("b", []byte("2"))
+	batch.Delete("stale")
+
+	if err := d.Write(&batch); err != nil {
+		t.Fatal(err)
+	}
+
+	va, ok, err := d.Get("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || !bytes.Equal(va, []byte("1")) {
+		t.Fatalf("expected a=1, ok=%v got=%q", ok, va)
+	}
+
+	vb, ok, err := d.Get("b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || !bytes.Equal(vb, []byte("2")) {
+		t.Fatalf("expected b=2, ok=%v got=%q", ok, vb)
+	}
+
+	vstale, ok, err := d.Get("stale")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || vstale != nil {
+		t.Fatalf("expected stale deleted, ok=%v v=%v", ok, vstale)
+	}
+}
+
+func TestDBWriteBatch_FlushAndReopen(t *testing.T) {
+	dir := t.TempDir()
+	dbDir := filepath.Join(dir, "data")
+
+	d, err := Open(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var batch WriteBatch
+	batch.Put("a", []byte("1"))
+	batch.Put("b", []byte("2"))
+	batch.Delete("missing")
+
+	if err := d.Write(&batch); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	d2, err := Open(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d2.Close() }()
+
+	for _, tc := range []struct {
+		key  string
+		want []byte
+	}{
+		{key: "a", want: []byte("1")},
+		{key: "b", want: []byte("2")},
+	} {
+		got, ok, err := d2.Get(tc.key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok || !bytes.Equal(got, tc.want) {
+			t.Fatalf("expected %s=%q, ok=%v got=%q", tc.key, tc.want, ok, got)
+		}
+	}
+}

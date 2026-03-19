@@ -19,21 +19,44 @@ const (
 	writeOpDelete
 )
 
-type writeReq struct {
+type batchOp struct {
 	op    writeOp
 	key   string
 	value []byte
-	done  chan error
+}
+
+type writeReq struct {
+	ops  []batchOp
+	done chan error
 }
 
 var errDBClosed = errors.New("db: closed")
 
 func (d *DB) submitWrite(op writeOp, key string, value []byte) error {
-	req := &writeReq{
+	return d.submitWriteBatch([]batchOp{{
 		op:    op,
 		key:   key,
 		value: cloneWriteValue(value),
-		done:  make(chan error, 1),
+	}})
+}
+
+func (d *DB) submitWriteBatch(ops []batchOp) error {
+	if len(ops) == 0 {
+		return nil
+	}
+
+	cloned := make([]batchOp, len(ops))
+	for i, op := range ops {
+		cloned[i] = batchOp{
+			op:    op.op,
+			key:   op.key,
+			value: cloneWriteValue(op.value),
+		}
+	}
+
+	req := &writeReq{
+		ops:  cloned,
+		done: make(chan error, 1),
 	}
 
 	d.writeMu.RLock()
@@ -61,7 +84,6 @@ func (d *DB) writeLoop() {
 		timer := time.NewTimer(writeBatchMaxDelay)
 		closed := false
 
-	// 标签控制流
 	collect:
 		for len(batch) < writeBatchMaxCount {
 			select {
@@ -76,7 +98,7 @@ func (d *DB) writeLoop() {
 			}
 		}
 
-		if !timer.Stop() { // 时钟信号已经发送
+		if !timer.Stop() {
 			select {
 			case <-timer.C:
 			default:
@@ -95,20 +117,28 @@ func (d *DB) applyWriteBatch(batch []*writeReq) {
 
 	err := d.checkBGErrLocked()
 	if err == nil {
-		records := make([]wal.Record, len(batch))
-		for i, req := range batch {
-			records[i] = wal.Record{
-				Key:   req.key,
-				Value: req.value,
-			}
-			if req.op == writeOpDelete {
-				records[i].Op = 1
-			} else {
-				records[i].Op = 0
+		totalOps := 0
+		for _, req := range batch {
+			totalOps += len(req.ops)
+		}
+
+		records := make([]wal.Record, 0, totalOps)
+		for _, req := range batch {
+			for _, op := range req.ops {
+				rec := wal.Record{
+					Key:   op.key,
+					Value: op.value,
+				}
+				if op.op == writeOpDelete {
+					rec.Op = 1
+				} else {
+					rec.Op = 0
+				}
+				records = append(records, rec)
 			}
 		}
 
-		// 先批量写 WAL，再按策略 fsync，最后按原顺序应用到 MemTable，
+		// 先批量写 WAL，再按策略 fsync，最后按原顺序应用到 MemTable。
 		// 保持 WAL-before-mem 语义。
 		if err = d.wal.AppendBatch(records); err == nil {
 			d.writeSeq++
@@ -123,13 +153,15 @@ func (d *DB) applyWriteBatch(batch []*writeReq) {
 
 		if err == nil {
 			for _, req := range batch {
-				if req.op == writeOpDelete {
-					d.mem.Delete(req.key)
-				} else {
-					d.mem.Put(req.key, req.value)
+				for _, op := range req.ops {
+					if op.op == writeOpDelete {
+						d.mem.Delete(op.key)
+					} else {
+						d.mem.Put(op.key, op.value)
+					}
 				}
 			}
-			
+
 			if d.shouldAutoFlushLocked() {
 				d.requestAutoFlush()
 			}

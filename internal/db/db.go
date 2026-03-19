@@ -285,6 +285,15 @@ func (d *DB) Put(key string, value []byte) error {
 	return d.submitWrite(writeOpPut, key, value)
 }
 
+// Write applies a batch of puts/deletes as one logical write request.
+// The batch is appended to WAL before any operation becomes visible in MemTable.
+func (d *DB) Write(batch *WriteBatch) error {
+	if batch == nil || len(batch.ops) == 0 {
+		return nil
+	}
+	return d.submitWriteBatch(batch.ops)
+}
+
 func (d *DB) Get(key string) ([]byte, bool, error) {
 	d.mu.Lock()
 	if err := d.checkBGErrLocked(); err != nil {
