@@ -8,9 +8,10 @@ import (
 )
 
 // cleanupTmpFiles removes any "*.tmp" files under sstDir.
-// Safe because tmp files are never "committed" (we always rename tmp->final atomically).
+// Safe because tmp files are never committed; they become visible only after rename.
 func cleanupTmpFiles(sstDir string) error {
-	return filepath.WalkDir(sstDir, func(path string, d fs.DirEntry, err error) error {
+	dirtyDirs := make(map[string]struct{})
+	if err := filepath.WalkDir(sstDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -18,10 +19,22 @@ func cleanupTmpFiles(sstDir string) error {
 			return nil
 		}
 		if strings.HasSuffix(d.Name(), ".tmp") {
-			_ = os.Remove(path)
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			dirtyDirs[filepath.Dir(path)] = struct{}{}
 		}
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+
+	for dir := range dirtyDirs {
+		if err := syncDirFn(dir); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // listAllSSTFiles collects all "*.sst" files under sstDir.
@@ -72,15 +85,13 @@ func findOrphanSST(all []string, ref map[string]struct{}) []string {
 	return orphan
 }
 
-// sanityCheckSSTDir cleans tmp files and checks for orphan SSTs.
-// If orphan exists, returns an error with a short list for debugging.
+// sanityCheckSSTDir cleans tmp files and removes orphan SSTs.
+// The manifest is the source of truth, so unreferenced SSTs are discarded.
 func sanityCheckSSTDir(sstDir string, levels []level) ([]string, error) {
-	// 1) clean tmp
 	if err := cleanupTmpFiles(sstDir); err != nil {
 		return nil, err
 	}
 
-	// 2) detect orphan sst
 	all, err := listAllSSTFiles(sstDir)
 	if err != nil {
 		return nil, err
@@ -89,6 +100,11 @@ func sanityCheckSSTDir(sstDir string, levels []level) ([]string, error) {
 	orphan := findOrphanSST(all, ref)
 	if len(orphan) == 0 {
 		return nil, nil
+	}
+	for _, p := range orphan {
+		if err := removeFileAndSync(p); err != nil {
+			return nil, err
+		}
 	}
 	return orphan, nil
 }

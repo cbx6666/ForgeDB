@@ -391,6 +391,9 @@ func TestDB_Reopen_RecoversWhenFlushSSTExistsButInstallNotDone(t *testing.T) {
 	if !okNew || string(gotNew) != "v-new" {
 		t.Fatalf("want new=v-new after reopen, ok=%v got=%q", okNew, string(gotNew))
 	}
+	if fileExists(job.path) {
+		t.Fatalf("expected orphan sst cleaned on reopen: %s", job.path)
+	}
 }
 
 // 4) sanity: 多次 Flush 后 imm 不残留、L0 递增、读语义正确

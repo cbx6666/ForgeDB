@@ -182,7 +182,7 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 		if len(show) > 10 {
 			show = show[:10]
 		}
-		fmt.Printf("WARN: db: found orphan sst files (not referenced by manifest): %v (total=%d)\n", show, len(orphan))
+		fmt.Printf("WARN: db: removed orphan sst files not referenced by manifest: %v (total=%d)\n", show, len(orphan))
 	}
 
 	db := &DB{

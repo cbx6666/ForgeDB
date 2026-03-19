@@ -326,6 +326,13 @@ func (d *DB) writeRuns(dstLevel int, merged []types.Entry) ([]levelFile, []strin
 			}
 			return nil, nil, err
 		}
+		if err := syncPathDir(finalPath); err != nil {
+			_ = os.Remove(finalPath)
+			for _, p := range created {
+				_ = os.Remove(p)
+			}
+			return nil, nil, err
+		}
 
 		created = append(created, finalPath)
 		newRuns = append(newRuns, levelFile{

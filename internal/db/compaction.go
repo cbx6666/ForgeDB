@@ -2,7 +2,6 @@ package db
 
 import (
 	"container/heap"
-	"os"
 	"sort"
 
 	"monolithdb/internal/sstable"
@@ -210,10 +209,14 @@ func (d *DB) installCompactionLocked(res *compactionResult) error {
 
 	// 5) 删除旧文件：srcPaths + realOldDst
 	for _, p := range job.srcPaths {
-		_ = os.Remove(p)
+		if err := removeFileAndSync(p); err != nil {
+			return err
+		}
 	}
 	for _, p := range realOldDst {
-		_ = os.Remove(p)
+		if err := removeFileAndSync(p); err != nil {
+			return err
+		}
 	}
 
 	// 6) 删除标记

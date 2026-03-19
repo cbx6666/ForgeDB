@@ -38,18 +38,17 @@ func (d *DB) prepareFlushLocked() (*flushJob, error) {
 	d.mem = memtable.NewMemTable()
 
 	// 2) rotate wal:
-	// forge.wal  -> forge.flush.wal
-	// new forge.wal for new writes
+	// forge.wal -> forge.flush.wal
+	// open a fresh forge.wal for subsequent writes
 	if err := d.wal.Close(); err != nil {
-		// rollback
 		d.mem = oldMem
 		d.imm = nil
 		return nil, err
 	}
 
-	_ = os.Remove(d.immWalPath) // 清理旧残留（正常情况下不应该存在）
+	// 清理旧残留（正常情况下不应该存在）
+	_ = removeFileAndSync(d.immWalPath)
 	if err := os.Rename(d.walPath, d.immWalPath); err != nil {
-		// 尝试恢复
 		w, openErr := wal.Open(d.walPath)
 		if openErr == nil {
 			d.wal = w
@@ -61,7 +60,6 @@ func (d *DB) prepareFlushLocked() (*flushJob, error) {
 
 	newWal, err := wal.Open(d.walPath)
 	if err != nil {
-		// 尝试恢复：把 flush wal 改回去
 		_ = os.Rename(d.immWalPath, d.walPath)
 		w, openErr := wal.Open(d.walPath)
 		if openErr == nil {
@@ -72,6 +70,10 @@ func (d *DB) prepareFlushLocked() (*flushJob, error) {
 		return nil, err
 	}
 	d.wal = newWal
+
+	if err := syncDirFn(d.dir); err != nil {
+		return nil, err
+	}
 
 	return &flushJob{
 		id:      id,
@@ -100,6 +102,9 @@ func (d *DB) doFlush(job *flushJob) error {
 		_ = os.Remove(job.tmpPath)
 		return err
 	}
+	if err := syncPathDir(job.path); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -119,7 +124,9 @@ func (d *DB) installFlushLocked(job *flushJob) error {
 
 	// flush 成功，冻结 mem / flush wal 可以清理掉
 	d.imm = nil
-	_ = os.Remove(d.immWalPath)
+	if err := removeFileAndSync(d.immWalPath); err != nil {
+		return err
+	}
 
 	// 唤醒后台 compaction
 	d.requestCompactionLocked()
