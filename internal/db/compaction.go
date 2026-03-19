@@ -209,11 +209,17 @@ func (d *DB) installCompactionLocked(res *compactionResult) error {
 
 	// 5) 删除旧文件：srcPaths + realOldDst
 	for _, p := range job.srcPaths {
+		if d.cache != nil {
+			d.cache.Evict(p)
+		}
 		if err := removeFileAndSync(p); err != nil {
 			return err
 		}
 	}
 	for _, p := range realOldDst {
+		if d.cache != nil {
+			d.cache.Evict(p)
+		}
 		if err := removeFileAndSync(p); err != nil {
 			return err
 		}

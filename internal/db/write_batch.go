@@ -1,7 +1,7 @@
 package db
 
-// WriteBatch collects multiple mutations that should be submitted together.
-// Zero value is ready to use.
+// WriteBatch 用于收集多条要一起提交的变更。
+// 零值可直接使用。
 type WriteBatch struct {
 	ops []batchOp
 }

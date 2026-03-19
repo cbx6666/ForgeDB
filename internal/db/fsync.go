@@ -7,12 +7,13 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 )
 
 var syncDirFn = syncDirIfSupported
 
-// syncDirIfSupported best-effort 地持久化目录项变更。
-// 这用于覆盖 rename/remove 之后的父目录元数据落盘。
+// syncDirIfSupported 尽力持久化目录项变更。
+// 这用于覆盖 rename/remove 之后父目录元数据的落盘。
 // Windows 上目录 fsync 语义不稳定，这里直接跳过。
 func syncDirIfSupported(dir string) error {
 	if runtime.GOOS == "windows" {
@@ -61,11 +62,41 @@ func syncPathDir(path string) error {
 	return syncDirFn(filepath.Dir(path))
 }
 
-// removeFileAndSync 删除文件后同步其父目录，避免目录项变更只停留在页缓存里。
+// removeFileAndSync 删除文件后同步其父目录。
+// Windows 上如果遇到短暂的共享冲突，会做几次短重试。
 func removeFileAndSync(path string) error {
-	err := os.Remove(path)
+	var err error
+	for i := 0; i < 8; i++ {
+		err = os.Remove(path)
+		if err == nil || os.IsNotExist(err) {
+			return syncPathDir(path)
+		}
+		if !isTransientRemoveErr(err) {
+			return err
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return syncPathDir(path)
+}
+
+// isTransientRemoveErr 判断 Windows 上的临时共享冲突，
+// 这类错误短暂重试后往往可以恢复。
+func isTransientRemoveErr(err error) bool {
+	if err == nil || runtime.GOOS != "windows" {
+		return false
+	}
+
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		var errno syscall.Errno
+		if errors.As(pathErr.Err, &errno) {
+			return errno == syscall.Errno(32) || errno == syscall.Errno(5)
+		}
+	}
+
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "being used by another process") || strings.Contains(msg, "access is denied")
 }

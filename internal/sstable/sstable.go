@@ -3,17 +3,14 @@ package sstable
 import (
 	"bufio"
 	"encoding/binary"
-	"errors"
-	"io"
 	"os"
 
 	"monolithdb/internal/types"
 )
 
 const (
-	magic uint32 = 0x46534442 // 'FSDB' = ForgeDB（仅用于识别文件）
-
-	headerSize = 8 // magic(uint32) + count(uint32)
+	magic      uint32 = 0x46534442 // 'FSDB'，用于识别 SSTable 文件
+	headerSize uint32 = 8          // magic(uint32) + count(uint32)
 )
 
 type countWriter struct {
@@ -41,7 +38,7 @@ func (cw *countWriter) WriteByte(b byte) error {
 
 func (cw *countWriter) Flush() error { return cw.w.Flush() }
 
-// WriteTable 将有序 entries 写入 SSTable 文件。
+// WriteTable 将有序的 entries 写入一个 SSTable 文件。
 func WriteTable(path string, entries []types.Entry) error {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 	if err != nil {
@@ -146,122 +143,12 @@ func WriteTable(path string, entries []types.Entry) error {
 	return f.Sync()
 }
 
-// Get 从 SSTable 文件中查找 key。
+// Get 查询指定 key。
+// 当前实现会按需加载表元信息，再到对应的数据区间里做扫描。
 func Get(path string, key string) ([]byte, GetResult, error) {
-	f, err := os.Open(path)
+	meta, err := openTableMeta(path)
 	if err != nil {
 		return nil, NotFound, err
 	}
-	defer f.Close()
-
-	r := bufio.NewReaderSize(f, 64*1024)
-
-	// 1) 读 header
-	var m uint32
-	if err := binary.Read(r, binary.LittleEndian, &m); err != nil {
-		return nil, NotFound, err
-	}
-	if m != magic {
-		return nil, NotFound, ErrCorruptSST
-	}
-
-	var count uint32
-	if err := binary.Read(r, binary.LittleEndian, &count); err != nil {
-		return nil, NotFound, ErrCorruptSST
-	}
-
-	// 2) 读取 stat + footer
-	st, err := f.Stat()
-	if err != nil {
-		return nil, NotFound, err
-	}
-	fileSize := st.Size()
-
-	indexStartOffset, bloomStartOffset, err := loadFooter(f, fileSize)
-	if err != nil {
-		return nil, NotFound, err
-	}
-
-	// 3) bloom：读取 [bloomStartOffset, footerStart)
-	footerStart := uint64(fileSize) - uint64(footerSize)
-	br := io.NewSectionReader(f, int64(bloomStartOffset), int64(footerStart-bloomStartOffset))
-
-	bloomBytes, err := io.ReadAll(br)
-	if err != nil {
-		return nil, NotFound, err
-	}
-
-	bf, ok := unmarshalBloom(bloomBytes)
-	if !ok || bf.m == 0 || bf.k == 0 {
-		return nil, NotFound, ErrCorruptSST
-	}
-
-	// Bloom 明确“不存在” => 快速返回
-	if !bf.mayContain(key) {
-		return nil, NotFound, nil
-	}
-
-	// 4) 可能存在：加载索引并选择扫描区间
-	entries, indexStartOffset2, err := loadIndex(f, fileSize)
-	if err != nil {
-		return nil, NotFound, err
-	}
-	// 防御：确保 loadIndex 读到的 offset 与 footer 一致
-	if indexStartOffset2 != indexStartOffset {
-		return nil, NotFound, ErrCorruptSST
-	}
-
-	start, end := pickScanRange(entries, indexStartOffset, key)
-	if end <= start {
-		return nil, NotFound, ErrCorruptSST
-	}
-
-	section := io.NewSectionReader(f, int64(start), int64(end-start))
-	sr := bufio.NewReaderSize(section, 64*1024)
-
-	// 5) 根据索引查找
-	for {
-		var keyLen uint32
-		var valLen uint32
-
-		if err := binary.Read(sr, binary.LittleEndian, &keyLen); err != nil {
-			// 区间读完就结束：没找到
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				return nil, NotFound, nil
-			}
-			return nil, NotFound, ErrCorruptSST
-		}
-		if err := binary.Read(sr, binary.LittleEndian, &valLen); err != nil {
-			return nil, NotFound, ErrCorruptSST
-		}
-
-		tomb, err := sr.ReadByte()
-		if err != nil {
-			return nil, NotFound, ErrCorruptSST
-		}
-
-		keyB := make([]byte, keyLen)
-		if _, err := io.ReadFull(sr, keyB); err != nil {
-			return nil, NotFound, ErrCorruptSST
-		}
-
-		var valB []byte
-		if valLen > 0 {
-			valB = make([]byte, valLen)
-			if _, err := io.ReadFull(sr, valB); err != nil {
-				return nil, NotFound, ErrCorruptSST
-			}
-		}
-
-		k := string(keyB)
-		if k == key {
-			if tomb == 1 {
-				return nil, Deleted, nil
-			}
-			return valB, Found, nil
-		}
-		if k > key {
-			return nil, NotFound, nil
-		}
-	}
+	return meta.Get(key)
 }

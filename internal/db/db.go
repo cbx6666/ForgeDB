@@ -46,6 +46,7 @@ type DB struct {
 	current *Version
 	opt     Options
 	nextID  uint64
+	cache   *sstable.TableCache
 
 	// 写入批量合并：前台请求先进队列，由后台写协程做 group commit。
 	writeMu       sync.RWMutex
@@ -196,6 +197,7 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 		current:    newVersionFromLevels(levels),
 		opt:        opt,
 		nextID:     nextID,
+		cache:      sstable.NewTableCache(),
 		pending:    make(map[string]struct{}),
 		writeCh:    make(chan *writeReq, 256),
 		syncWAL:    w.Sync,
@@ -265,12 +267,15 @@ func (d *DB) Close() error {
 		syncErr = d.syncPendingWAL()
 	}
 
-	var err1, err2 error
+	var err1, err2, err3 error
 	if d.man != nil {
 		err1 = d.man.Close()
 	}
 	if d.wal != nil {
 		err2 = d.wal.Close()
+	}
+	if d.cache != nil {
+		err3 = d.cache.Close()
 	}
 	if err1 != nil {
 		return err1
@@ -278,15 +283,18 @@ func (d *DB) Close() error {
 	if syncErr != nil {
 		return syncErr
 	}
-	return err2
+	if err2 != nil {
+		return err2
+	}
+	return err3
 }
 
 func (d *DB) Put(key string, value []byte) error {
 	return d.submitWrite(writeOpPut, key, value)
 }
 
-// Write applies a batch of puts/deletes as one logical write request.
-// The batch is appended to WAL before any operation becomes visible in MemTable.
+// Write 将一组 Put/Delete 作为一次逻辑写请求提交。
+// 整个 batch 会先写入 WAL，再让其中的操作对 MemTable 可见。
 func (d *DB) Write(batch *WriteBatch) error {
 	if batch == nil || len(batch.ops) == 0 {
 		return nil
@@ -336,7 +344,7 @@ func (d *DB) Get(key string) ([]byte, bool, error) {
 		if li == 0 {
 			// L0 newest-first
 			for _, p := range lv.l0Paths {
-				v, res, err := sstable.Get(p, key)
+				v, res, err := d.cache.Get(p, key)
 				if err != nil {
 					return nil, false, err
 				}
@@ -352,7 +360,7 @@ func (d *DB) Get(key string) ([]byte, bool, error) {
 		} else {
 			// L>=1: run locate
 			if p, ok := findRun(lv.runs, key); ok {
-				v, res, err := sstable.Get(p, key)
+				v, res, err := d.cache.Get(p, key)
 				if err != nil {
 					return nil, false, err
 				}
@@ -375,9 +383,9 @@ func (d *DB) Delete(key string) error {
 	return d.submitWrite(writeOpDelete, key, nil)
 }
 
-// Flush flushes current MemTable to a new L0 SST.
-// It rotates active memtable/WAL first so foreground writes can continue.
-// It does NOT guarantee compaction completion; compaction runs asynchronously.
+// Flush 将当前 MemTable 刷成新的 L0 SST。
+// 它会先切换 active memtable/WAL，这样前台写入可以继续进行。
+// 它不保证 compaction 完成；compaction 仍由后台异步执行。
 func (d *DB) Flush() error {
 	d.mu.Lock()
 	if err := d.checkBGErrLocked(); err != nil {
