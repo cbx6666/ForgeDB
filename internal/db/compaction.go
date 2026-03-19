@@ -8,7 +8,7 @@ import (
 	"monolithdb/internal/types"
 )
 
-// 堆元素：某个 SST 的当前记录 + 该 SST 的新旧优先级
+// heapItem 表示某个 SST 当前迭代到的记录，以及这一路输入的优先级。
 type heapItem struct {
 	it       *sstable.Iter
 	ent      types.Entry
@@ -73,7 +73,7 @@ func (d *DB) pickCompactionJobLocked(level int) (*compactionJob, error) {
 	src := &v.levels[level]
 	dst := &v.levels[level+1]
 
-	// src 为空直接返回
+	// 源层为空则没有可做的 compaction。
 	if level == 0 {
 		if len(src.l0Paths) == 0 {
 			return nil, nil
@@ -89,7 +89,7 @@ func (d *DB) pickCompactionJobLocked(level int) (*compactionJob, error) {
 		return nil, nil
 	}
 
-	// 1) pick inputs from src
+	// 1) 从源层挑一批输入文件。
 	var pickedPaths []string
 	if level == 0 {
 		picked, _ := pickOldestL0(src.l0Paths, pickN, d.isPendingLocked)
@@ -104,13 +104,13 @@ func (d *DB) pickCompactionJobLocked(level int) (*compactionJob, error) {
 		return nil, nil
 	}
 
-	// 2) range of picked
+	// 2) 计算这批输入覆盖的整体 key 范围。
 	minK, maxK, err := rangeOfFiles(pickedPaths)
 	if err != nil {
 		return nil, err
 	}
 
-	// 3) overlap in dst (基于当前 dst.runs)
+	// 3) 找到目标层里和这段范围有重叠的文件。
 	overIdx := overlappedRuns(dst.runs, minK, maxK)
 	dstPaths := make([]string, 0, len(overIdx))
 	for _, i := range overIdx {
@@ -122,7 +122,7 @@ func (d *DB) pickCompactionJobLocked(level int) (*compactionJob, error) {
 		dstPaths = append(dstPaths, p)
 	}
 
-	// 4) 标记 pending
+	// 4) 标记 pending，避免后台并发重复选中。
 	all := make([]string, 0, len(pickedPaths)+len(dstPaths))
 	all = append(all, pickedPaths...)
 	all = append(all, dstPaths...)
@@ -142,7 +142,7 @@ func (d *DB) doCompaction(job *compactionJob) (*compactionResult, error) {
 	inputs = append(inputs, job.srcPaths...)
 	inputs = append(inputs, job.dstPaths...)
 
-	// 目标层已经是最高层时，后面不再有更老的数据需要被 tombstone 遮蔽，
+	// 目标层已经是最后一层时，后面不再有更老的数据需要被 tombstone 遮蔽，
 	// 因此可以在这次 compaction 中直接丢弃删除标记。
 	dropBottomTombstones := job.level+1 == d.opt.numLevels-1
 	newRuns, _, err := d.streamCompactionRuns(job.level+1, inputs, dropBottomTombstones)
@@ -210,7 +210,7 @@ func (d *DB) streamCompactionRuns(dstLevel int, inputs []string, dropBottomTombs
 	}
 
 	emit := func(ent types.Entry) error {
-		// 到达最高层时，墓碑已经不需要再向下传播，可以直接丢弃。
+		// 到达最后一层时，墓碑已经不需要再向后传播，可以直接丢弃。
 		if dropBottomTombstones && ent.Tombstone {
 			return nil
 		}
@@ -225,7 +225,8 @@ func (d *DB) streamCompactionRuns(dstLevel int, inputs []string, dropBottomTombs
 	hasLast := false
 
 	for h.Len() > 0 {
-		// 每次取出当前全局最小 key；若 key 相同，则由 heap 的 priority 保证“较新的输入先出堆”。
+		// 每次取出当前全局最小 key；若 key 相同，则由 heap 的 priority
+		// 保证“较新的输入先出堆”。
 		item := heap.Pop(h).(heapItem)
 
 		if !hasLast || item.ent.Key != lastKey {
@@ -269,21 +270,21 @@ func (d *DB) installCompactionLocked(res *compactionResult) error {
 	src := &newv.levels[level]
 	dst := &newv.levels[level+1]
 
-	// 1) 从 src 移除 job.srcPaths
+	// 1) 从源层移除 job.srcPaths。
 	if level == 0 {
 		src.l0Paths = removePaths(src.l0Paths, job.srcPaths)
 	} else {
 		src.runs = removeRunsByPaths(src.runs, job.srcPaths)
 	}
 
-	// 2) 重新算 overlap（用 job.minKey/maxKey，而不是用旧的 dstPaths 快照）
+	// 2) 重新算 overlap（用 job.minKey/maxKey，而不是用旧的 dstPaths 快照）。
 	overIdx := overlappedRuns(dst.runs, job.minKey, job.maxKey)
 	realOldDst := make([]string, 0, len(overIdx))
 	for _, i := range overIdx {
 		realOldDst = append(realOldDst, dst.runs[i].path)
 	}
 
-	// 3) 替换 dst 的 overlap 区间
+	// 3) 替换 dst 的 overlap 区间。
 	newDst := make([]levelFile, 0, len(dst.runs)-len(overIdx)+len(res.newRuns))
 	if len(overIdx) == 0 {
 		newDst = append(newDst, dst.runs...)
@@ -298,14 +299,14 @@ func (d *DB) installCompactionLocked(res *compactionResult) error {
 	}
 	dst.runs = newDst
 
-	// 4) persist manifest
+	// 4) 持久化 manifest。
 	if err := d.persistManifestLevels(newv.levels); err != nil {
 		return err
 	}
 
 	d.current = newv
 
-	// 5) 删除旧文件：srcPaths + realOldDst
+	// 5) 删除旧文件：srcPaths + realOldDst。
 	for _, p := range job.srcPaths {
 		if d.cache != nil {
 			d.cache.Evict(p)
@@ -323,7 +324,7 @@ func (d *DB) installCompactionLocked(res *compactionResult) error {
 		}
 	}
 
-	// 6) 删除标记
+	// 6) 清除 pending 标记。
 	all := make([]string, 0, len(job.srcPaths)+len(realOldDst))
 	all = append(all, job.srcPaths...)
 	all = append(all, realOldDst...)
@@ -335,25 +336,61 @@ func (d *DB) installCompactionLocked(res *compactionResult) error {
 func (d *DB) pickCompactionLevelLocked() (int, bool) {
 	v := d.currentVersion()
 
-	// 从低层往高层找第一个超阈值的
+	type levelScore struct {
+		level   int
+		current int
+		limit   int
+		debt    int
+	}
+
+	betterThan := func(a, b levelScore) bool {
+		// 先比较超阈值比例，再比较超额文件数，最后用层号做稳定 tie-break。
+		left := a.current * b.limit
+		right := b.current * a.limit
+		if left != right {
+			return left > right
+		}
+		if a.debt != b.debt {
+			return a.debt > b.debt
+		}
+		return a.level < b.level
+	}
+
+	best := levelScore{level: -1}
+
 	for level := 0; level < len(v.levels)-1; level++ {
 		maxFiles := d.opt.levels[level].maxFiles
 		if maxFiles <= 0 {
 			continue
 		}
 
-		over := false
+		current := 0
 		if level == 0 {
-			over = len(v.levels[level].l0Paths) > maxFiles
+			current = len(v.levels[level].l0Paths)
 		} else {
-			over = len(v.levels[level].runs) > maxFiles
+			current = len(v.levels[level].runs)
 		}
 
-		if over {
-			return level, true
+		if current <= maxFiles {
+			continue
+		}
+
+		debt := current - maxFiles
+
+		cand := levelScore{
+			level:   level,
+			current: current,
+			limit:   maxFiles,
+			debt:    debt,
+		}
+		if best.level < 0 || betterThan(cand, best) {
+			best = cand
 		}
 	}
-	return 0, false
+	if best.level < 0 {
+		return 0, false
+	}
+	return best.level, true
 }
 
 func (d *DB) isPendingLocked(path string) bool {

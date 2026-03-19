@@ -88,6 +88,47 @@ func assertInvariantsLocked(t *testing.T, d *DB) {
 	}
 }
 
+func TestDB_PickCompactionLevel_PrefersMostOverloadedLevel(t *testing.T) {
+	dir := t.TempDir()
+
+	opt := defaultOptions()
+	opt.numLevels = 3
+	opt.levels = []LevelOptions{
+		{maxFiles: 4, pickN: 2, runMaxEntries: 0},
+		{maxFiles: 2, pickN: 1, runMaxEntries: 32},
+		{maxFiles: 0, pickN: 0, runMaxEntries: 64},
+	}
+
+	d, err := OpenWithOptions(dir, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+
+	d.mu.Lock()
+	v := d.currentVersion().withLevels()
+	v.levels[0].l0Paths = []string{"l0-a", "l0-b", "l0-c", "l0-d", "l0-e"}
+	v.levels[1].runs = []levelFile{
+		{id: 1, path: "l1-1", minKey: "a", maxKey: "b"},
+		{id: 2, path: "l1-2", minKey: "c", maxKey: "d"},
+		{id: 3, path: "l1-3", minKey: "e", maxKey: "f"},
+		{id: 4, path: "l1-4", minKey: "g", maxKey: "h"},
+		{id: 5, path: "l1-5", minKey: "i", maxKey: "j"},
+		{id: 6, path: "l1-6", minKey: "k", maxKey: "l"},
+	}
+	d.current = v
+
+	level, ok := d.pickCompactionLevelLocked()
+	d.mu.Unlock()
+
+	if !ok {
+		t.Fatal("expected a compaction level to be selected")
+	}
+	if level != 1 {
+		t.Fatalf("expected level 1 to be picked, got %d", level)
+	}
+}
+
 func mustBuildManualL0Compaction(t *testing.T, d *DB) (*compactionJob, *compactionResult) {
 	t.Helper()
 
