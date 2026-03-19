@@ -52,6 +52,11 @@ type DB struct {
 	writeCh     chan *writeReq
 	writeClosed bool
 	syncWAL     func() error
+	syncStop    chan struct{}
+
+	// 用批次序号跟踪“已经写入 WAL”与“已经 fsync”的边界。
+	writeSeq  uint64
+	syncedSeq uint64
 
 	// bg compaction
 	mu   sync.Mutex
@@ -193,13 +198,24 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 		writeCh:    make(chan *writeReq, 256),
 		syncWAL:    w.Sync,
 	}
+
+	if opt.walSync == WALSyncInterval {
+		db.syncStop = make(chan struct{})
+	}
+
 	db.cond = sync.NewCond(&db.mu)
 
-	// 分别覆盖 compaction / write loop 的整个生命周期
+	// 分别覆盖 compaction / write loop / interval sync loop 的整个生命周期
 	db.wg.Add(1)
 	go db.compactionLoop()
+
 	db.wg.Add(1)
 	go db.writeLoop()
+	
+	if db.syncStop != nil {
+		db.wg.Add(1)
+		go db.walSyncLoop()
+	}
 
 	return db, nil
 }
@@ -220,8 +236,17 @@ func (d *DB) Close() error {
 	}
 	d.writeMu.Unlock()
 
+	if d.syncStop != nil {
+		close(d.syncStop)
+	}
+
 	// 保证在执行接下来的“关闭文件”动作前，没有任何后台协程还在尝试读写这些文件
 	d.wg.Wait()
+
+	var syncErr error
+	if d.opt.walSync == WALSyncInterval {
+		syncErr = d.syncPendingWAL()
+	}
 
 	var err1, err2 error
 	if d.man != nil {
@@ -232,6 +257,9 @@ func (d *DB) Close() error {
 	}
 	if err1 != nil {
 		return err1
+	}
+	if syncErr != nil {
+		return syncErr
 	}
 	return err2
 }

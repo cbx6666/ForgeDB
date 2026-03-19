@@ -1,6 +1,9 @@
 package db
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 type LevelOptions struct {
 	// 触发 compaction 的阈值
@@ -9,7 +12,8 @@ type LevelOptions struct {
 	// 每次 compaction 从该层挑选的文件数
 	pickN int
 
-	// 目标层输出 run 的最大 entry 数（split）。对 L0 无意义，填 0 即可。
+	// 目标层输出 run 的最大 entry 数（split）。
+	// 对 L0 无意义，填 0 即可。
 	runMaxEntries int
 }
 
@@ -20,12 +24,15 @@ const (
 	WALSyncNever WALSyncMode = iota
 	// WALSyncEveryBatch 每个批次写完都执行一次 fsync。
 	WALSyncEveryBatch
+	// WALSyncInterval 由后台协程按固定间隔执行 fsync。
+	WALSyncInterval
 )
 
 type Options struct {
-	numLevels int
-	levels    []LevelOptions
-	walSync   WALSyncMode
+	numLevels       int
+	levels          []LevelOptions
+	walSync         WALSyncMode
+	walSyncInterval time.Duration
 }
 
 func defaultOptions() Options {
@@ -36,7 +43,8 @@ func defaultOptions() Options {
 			{maxFiles: 8, pickN: 1, runMaxEntries: 256},
 			{maxFiles: 0, pickN: 0, runMaxEntries: 1024},
 		},
-		walSync: WALSyncNever,
+		walSync:         WALSyncNever,
+		walSyncInterval: 10 * time.Millisecond,
 	}
 }
 
@@ -47,7 +55,14 @@ func validateOptions(opt Options) error {
 	if len(opt.levels) != opt.numLevels {
 		return fmt.Errorf("db: levels len(%d) != numLevels(%d)", len(opt.levels), opt.numLevels)
 	}
-	if opt.walSync != WALSyncNever && opt.walSync != WALSyncEveryBatch {
+
+	switch opt.walSync {
+	case WALSyncNever, WALSyncEveryBatch:
+	case WALSyncInterval:
+		if opt.walSyncInterval <= 0 {
+			return fmt.Errorf("db: walSyncInterval must be > 0 when walSync=Interval")
+		}
+	default:
 		return fmt.Errorf("db: invalid walSync mode %d", opt.walSync)
 	}
 

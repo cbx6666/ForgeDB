@@ -111,10 +111,16 @@ func (d *DB) applyWriteBatch(batch []*writeReq) {
 		// 先批量写 WAL，再按策略 fsync，最后按原顺序应用到 MemTable，
 		// 保持 WAL-before-mem 语义。
 		if err = d.wal.AppendBatch(records); err == nil {
+			d.writeSeq++
+
 			if d.opt.walSync == WALSyncEveryBatch {
 				err = d.syncWAL()
+				if err == nil {
+					d.syncedSeq = d.writeSeq
+				}
 			}
 		}
+
 		if err == nil {
 			for _, req := range batch {
 				if req.op == writeOpDelete {
@@ -133,6 +139,56 @@ func (d *DB) applyWriteBatch(batch []*writeReq) {
 	for _, req := range batch {
 		req.done <- err
 	}
+}
+
+func (d *DB) walSyncLoop() {
+	defer d.wg.Done()
+
+	ticker := time.NewTicker(d.opt.walSyncInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := d.syncPendingWAL(); err != nil {
+				return
+			}
+		case <-d.syncStop:
+			return
+		}
+	}
+}
+
+func (d *DB) syncPendingWAL() error {
+	d.mu.Lock()
+	if d.bgErr != nil {
+		err := d.bgErr
+		d.mu.Unlock()
+		return err
+	}
+	if d.writeSeq == d.syncedSeq {
+		d.mu.Unlock()
+		return nil
+	}
+
+	targetSeq := d.writeSeq
+	d.mu.Unlock()
+
+	if err := d.syncWAL(); err != nil {
+		d.mu.Lock()
+		if d.bgErr == nil {
+			d.bgErr = err
+		}
+		d.mu.Unlock()
+		return err
+	}
+
+	d.mu.Lock()
+	if d.syncedSeq < targetSeq {
+		d.syncedSeq = targetSeq
+	}
+	d.mu.Unlock()
+	return nil
 }
 
 func cloneWriteValue(value []byte) []byte {
