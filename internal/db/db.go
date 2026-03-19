@@ -51,6 +51,7 @@ type DB struct {
 	writeMu     sync.RWMutex
 	writeCh     chan *writeReq
 	writeClosed bool
+	syncWAL     func() error
 
 	// bg compaction
 	mu   sync.Mutex
@@ -190,6 +191,7 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 		nextID:     nextID,
 		pending:    make(map[string]struct{}),
 		writeCh:    make(chan *writeReq, 256),
+		syncWAL:    w.Sync,
 	}
 	db.cond = sync.NewCond(&db.mu)
 

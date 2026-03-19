@@ -13,9 +13,19 @@ type LevelOptions struct {
 	runMaxEntries int
 }
 
+type WALSyncMode int
+
+const (
+	// WALSyncNever 只 Flush，不做 fsync。
+	WALSyncNever WALSyncMode = iota
+	// WALSyncEveryBatch 每个批次写完都执行一次 fsync。
+	WALSyncEveryBatch
+)
+
 type Options struct {
 	numLevels int
 	levels    []LevelOptions
+	walSync   WALSyncMode
 }
 
 func defaultOptions() Options {
@@ -26,6 +36,7 @@ func defaultOptions() Options {
 			{maxFiles: 8, pickN: 1, runMaxEntries: 256},
 			{maxFiles: 0, pickN: 0, runMaxEntries: 1024},
 		},
+		walSync: WALSyncNever,
 	}
 }
 
@@ -35,6 +46,9 @@ func validateOptions(opt Options) error {
 	}
 	if len(opt.levels) != opt.numLevels {
 		return fmt.Errorf("db: levels len(%d) != numLevels(%d)", len(opt.levels), opt.numLevels)
+	}
+	if opt.walSync != WALSyncNever && opt.walSync != WALSyncEveryBatch {
+		return fmt.Errorf("db: invalid walSync mode %d", opt.walSync)
 	}
 
 	for i := 0; i < opt.numLevels; i++ {

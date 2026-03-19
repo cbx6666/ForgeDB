@@ -57,6 +57,22 @@ func (w *WAL) Close() error {
 	return nil
 }
 
+// Sync 强制将底层文件刷到存储设备。
+func (w *WAL) Sync() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.buf != nil {
+		if err := w.buf.Flush(); err != nil {
+			return err
+		}
+	}
+	if w.f == nil {
+		return nil
+	}
+	return w.f.Sync()
+}
+
 // AppendPut 追加一条 Put 记录到 WAL 文件。
 // 当前实现会委托给 AppendBatch，由批量写路径统一落盘。
 func (w *WAL) AppendPut(key string, value []byte) error {
@@ -91,7 +107,7 @@ func (w *WAL) AppendBatch(records []Record) error {
 			return err
 		}
 	}
-	
+
 	return w.buf.Flush()
 }
 

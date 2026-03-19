@@ -108,8 +108,14 @@ func (d *DB) applyWriteBatch(batch []*writeReq) {
 			}
 		}
 
-		// 先批量写 WAL，再按原顺序应用到 MemTable，保持 WAL-before-mem 语义。
+		// 先批量写 WAL，再按策略 fsync，最后按原顺序应用到 MemTable，
+		// 保持 WAL-before-mem 语义。
 		if err = d.wal.AppendBatch(records); err == nil {
+			if d.opt.walSync == WALSyncEveryBatch {
+				err = d.syncWAL()
+			}
+		}
+		if err == nil {
 			for _, req := range batch {
 				if req.op == writeOpDelete {
 					d.mem.Delete(req.key)
