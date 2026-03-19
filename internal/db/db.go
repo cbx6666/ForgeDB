@@ -48,11 +48,13 @@ type DB struct {
 	nextID  uint64
 
 	// 写入批量合并：前台请求先进队列，由后台写协程做 group commit。
-	writeMu     sync.RWMutex
-	writeCh     chan *writeReq
-	writeClosed bool
-	syncWAL     func() error
-	syncStop    chan struct{}
+	writeMu       sync.RWMutex
+	writeCh       chan *writeReq
+	writeClosed   bool
+	syncWAL       func() error
+	syncStop      chan struct{}
+	autoFlushCh   chan struct{}
+	autoFlushStop chan struct{}
 
 	// 用批次序号跟踪“已经写入 WAL”与“已经 fsync”的边界。
 	writeSeq  uint64
@@ -203,18 +205,30 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 		db.syncStop = make(chan struct{})
 	}
 
+	if opt.autoFlushBytes > 0 {
+		db.autoFlushCh = make(chan struct{}, 1)
+		db.autoFlushStop = make(chan struct{})
+	}
+
 	db.cond = sync.NewCond(&db.mu)
 
-	// 分别覆盖 compaction / write loop / interval sync loop 的整个生命周期
+	// 分别覆盖 compaction / write loop / interval sync loop / auto flush loop 的整个生命周期
 	db.wg.Add(1)
 	go db.compactionLoop()
 
 	db.wg.Add(1)
 	go db.writeLoop()
-	
+
 	if db.syncStop != nil {
 		db.wg.Add(1)
 		go db.walSyncLoop()
+	}
+
+	if db.autoFlushCh != nil {
+		db.wg.Add(1)
+		go db.autoFlushLoop()
+		// 处理启动后已经装进 memtable 的数据
+		db.requestAutoFlush()
 	}
 
 	return db, nil
@@ -238,6 +252,9 @@ func (d *DB) Close() error {
 
 	if d.syncStop != nil {
 		close(d.syncStop)
+	}
+	if d.autoFlushStop != nil {
+		close(d.autoFlushStop)
 	}
 
 	// 保证在执行接下来的“关闭文件”动作前，没有任何后台协程还在尝试读写这些文件

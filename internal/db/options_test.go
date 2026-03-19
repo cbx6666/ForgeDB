@@ -38,3 +38,11 @@ func TestOptionsWithWALSync_KeepsExistingIntervalForNonIntervalMode(t *testing.T
 		t.Fatalf("expected walSyncInterval unchanged, got %s", opt.walSyncInterval)
 	}
 }
+
+func TestOptionsWithAutoFlushBytes_ConfiguresThreshold(t *testing.T) {
+	opt := DefaultOptions().WithAutoFlushBytes(4096)
+
+	if opt.autoFlushBytes != 4096 {
+		t.Fatalf("expected autoFlushBytes=4096, got %d", opt.autoFlushBytes)
+	}
+}

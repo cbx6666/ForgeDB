@@ -5,7 +5,8 @@ import "monolithdb/internal/types"
 // MemTable 是数据库的内存表：对外提供 Put/Get/Delete/Range。
 // 内部用 SkipList 存储有序 key。
 type MemTable struct {
-	sl *SkipList
+	sl          *SkipList
+	approxBytes int
 }
 
 func NewMemTable() *MemTable {
@@ -21,6 +22,7 @@ func (m *MemTable) Put(key string, value []byte) {
 	}
 
 	m.sl.Upsert(key, e)
+	m.approxBytes += len(key) + len(value) + 1
 }
 
 // Get 查询：先从 SkipList.Search 拿到 Entry，再处理 tombstone。
@@ -54,6 +56,7 @@ func (m *MemTable) Delete(key string) {
 	}
 
 	m.sl.Upsert(key, e)
+	m.approxBytes += len(key) + 1
 }
 
 // Range 范围查询：返回 [start, end) 的有序记录。
@@ -116,4 +119,11 @@ func cloneBytes(b []byte) []byte {
 	cp := make([]byte, len(b))
 	copy(cp, b)
 	return cp
+}
+
+func (m *MemTable) ApproxSize() int {
+	if m == nil {
+		return 0
+	}
+	return m.approxBytes
 }

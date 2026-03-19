@@ -33,6 +33,7 @@ type Options struct {
 	levels          []LevelOptions
 	walSync         WALSyncMode
 	walSyncInterval time.Duration
+	autoFlushBytes  int
 }
 
 // DefaultOptions 返回一份可供调用方修改的默认配置副本。
@@ -50,6 +51,13 @@ func (opt Options) WithWALSync(mode WALSyncMode, interval time.Duration) Options
 	return opt
 }
 
+// WithAutoFlushBytes 返回一份带有自动 flush 阈值的新配置。
+// bytes <= 0 表示关闭自动 flush。
+func (opt Options) WithAutoFlushBytes(bytes int) Options {
+	opt.autoFlushBytes = bytes
+	return opt
+}
+
 func defaultOptions() Options {
 	return Options{
 		numLevels: 3,
@@ -60,6 +68,7 @@ func defaultOptions() Options {
 		},
 		walSync:         WALSyncNever,
 		walSyncInterval: 10 * time.Millisecond,
+		autoFlushBytes:  0,
 	}
 }
 
@@ -79,6 +88,9 @@ func validateOptions(opt Options) error {
 		}
 	default:
 		return fmt.Errorf("db: invalid walSync mode %d", opt.walSync)
+	}
+	if opt.autoFlushBytes < 0 {
+		return fmt.Errorf("db: autoFlushBytes must be >= 0")
 	}
 
 	for i := 0; i < opt.numLevels; i++ {

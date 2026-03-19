@@ -129,6 +129,10 @@ func (d *DB) applyWriteBatch(batch []*writeReq) {
 					d.mem.Put(req.key, req.value)
 				}
 			}
+			
+			if d.shouldAutoFlushLocked() {
+				d.requestAutoFlush()
+			}
 		} else {
 			d.bgErr = err
 		}
