@@ -32,7 +32,6 @@ const (
 // Open 打开或创建 WAL 文件，准备追加写。
 func Open(path string) (*WAL, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
-
 	if err != nil {
 		return nil, err
 	}
@@ -55,69 +54,74 @@ func (w *WAL) Close() error {
 	if w.f != nil {
 		return w.f.Close()
 	}
-
 	return nil
 }
 
 // AppendPut 追加一条 Put 记录到 WAL 文件。
-// 记录格式：| op(1B) | keyLen(uint32) | valLen(uint32) | key bytes | val bytes |
+// 当前实现会委托给 AppendBatch，由批量写路径统一落盘。
 func (w *WAL) AppendPut(key string, value []byte) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	// 1) op
-	if err := w.buf.WriteByte(opPut); err != nil {
-		return err
-	}
-
-	// 2) keyLen / valLen
-	keyB := []byte(key)
-	if err := binary.Write(w.buf, binary.LittleEndian, uint32(len(keyB))); err != nil {
-		return err
-	}
-	if err := binary.Write(w.buf, binary.LittleEndian, uint32(len(value))); err != nil {
-		return err
-	}
-
-	// 3) key bytes / value bytes
-	if _, err := w.buf.Write(keyB); err != nil {
-		return err
-	}
-	if len(value) > 0 {
-		if _, err := w.buf.Write(value); err != nil {
-			return err
-		}
-	}
-
-	return w.buf.Flush()
+	return w.AppendBatch([]Record{{
+		Op:    opPut,
+		Key:   key,
+		Value: value,
+	}})
 }
 
 // AppendDelete 追加一条 Delete 记录到 WAL 文件。
-// 记录格式：| op(1B) | keyLen(uint32) | valLen(uint32=0) | key bytes |
+// 当前实现会委托给 AppendBatch，由批量写路径统一落盘。
 func (w *WAL) AppendDelete(key string) error {
+	return w.AppendBatch([]Record{{
+		Op:  opDelete,
+		Key: key,
+	}})
+}
+
+// AppendBatch 追加多条记录到 WAL 文件。
+// 这是 group commit 的基础：一批记录只做一次 Flush。
+func (w *WAL) AppendBatch(records []Record) error {
+	if len(records) == 0 {
+		return nil
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// 1) op
-	if err := w.buf.WriteByte(opDelete); err != nil {
-		return err
+	for _, rec := range records {
+		if err := appendRecord(w.buf, rec); err != nil {
+			return err
+		}
 	}
-
-	// 2) keyLen / valLen(=0)
-	keyB := []byte(key)
-	if err := binary.Write(w.buf, binary.LittleEndian, uint32(len(keyB))); err != nil {
-		return err
-	}
-	if err := binary.Write(w.buf, binary.LittleEndian, uint32(0)); err != nil {
-		return err
-	}
-
-	// 3) key bytes
-	if _, err := w.buf.Write(keyB); err != nil {
-		return err
-	}
-
+	
 	return w.buf.Flush()
+}
+
+// appendRecord 把单条记录编码到 writer 中，格式与历史 WAL 保持一致。
+func appendRecord(w *bufio.Writer, rec Record) error {
+	if rec.Op != opPut && rec.Op != opDelete {
+		return ErrCorruptWAL
+	}
+
+	if err := w.WriteByte(rec.Op); err != nil {
+		return err
+	}
+
+	keyB := []byte(rec.Key)
+	if err := binary.Write(w, binary.LittleEndian, uint32(len(keyB))); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint32(len(rec.Value))); err != nil {
+		return err
+	}
+
+	if _, err := w.Write(keyB); err != nil {
+		return err
+	}
+	if len(rec.Value) > 0 {
+		if _, err := w.Write(rec.Value); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 var ErrCorruptWAL = errors.New("wal: corrupt record")

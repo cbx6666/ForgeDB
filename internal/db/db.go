@@ -47,6 +47,11 @@ type DB struct {
 	opt     Options
 	nextID  uint64
 
+	// 写入批量合并：前台请求先进队列，由后台写协程做 group commit。
+	writeMu     sync.RWMutex
+	writeCh     chan *writeReq
+	writeClosed bool
+
 	// bg compaction
 	mu   sync.Mutex
 	cond *sync.Cond
@@ -184,10 +189,16 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 		opt:        opt,
 		nextID:     nextID,
 		pending:    make(map[string]struct{}),
+		writeCh:    make(chan *writeReq, 256),
 	}
 	db.cond = sync.NewCond(&db.mu)
-	db.wg.Add(1) // 准确覆盖协程的整个生命周期
+
+	// 分别覆盖 compaction / write loop 的整个生命周期
+	db.wg.Add(1)
 	go db.compactionLoop()
+	db.wg.Add(1)
+	go db.writeLoop()
+
 	return db, nil
 }
 
@@ -195,10 +206,20 @@ func (d *DB) Close() error {
 	d.mu.Lock()
 	d.closing = true
 	if d.cond != nil {
-		d.cond.Broadcast() // 唤醒所有等待的携程并结束生命周期
+		// 唤醒所有等待的协程并结束生命周期
+		d.cond.Broadcast()
 	}
 	d.mu.Unlock()
-	d.wg.Wait() // 保证在执行接下来的“关闭文件”动作前，没有任何后台协程还在尝试读写这些文件
+
+	d.writeMu.Lock()
+	if !d.writeClosed {
+		d.writeClosed = true
+		close(d.writeCh)
+	}
+	d.writeMu.Unlock()
+
+	// 保证在执行接下来的“关闭文件”动作前，没有任何后台协程还在尝试读写这些文件
+	d.wg.Wait()
 
 	var err1, err2 error
 	if d.man != nil {
@@ -214,19 +235,7 @@ func (d *DB) Close() error {
 }
 
 func (d *DB) Put(key string, value []byte) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if err := d.checkBGErrLocked(); err != nil {
-		return err
-	}
-
-	// 先写 WAL（Write-Ahead）
-	if err := d.wal.AppendPut(key, value); err != nil {
-		return err
-	}
-	// 再写 MemTable
-	d.mem.Put(key, value)
-	return nil
+	return d.submitWrite(writeOpPut, key, value)
 }
 
 func (d *DB) Get(key string) ([]byte, bool, error) {
@@ -307,19 +316,7 @@ func (d *DB) Get(key string) ([]byte, bool, error) {
 }
 
 func (d *DB) Delete(key string) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if err := d.checkBGErrLocked(); err != nil {
-		return err
-	}
-
-	// 先写 WAL
-	if err := d.wal.AppendDelete(key); err != nil {
-		return err
-	}
-	// 再写 MemTable（tombstone）
-	d.mem.Delete(key)
-	return nil
+	return d.submitWrite(writeOpDelete, key, nil)
 }
 
 // Flush flushes current MemTable to a new L0 SST.

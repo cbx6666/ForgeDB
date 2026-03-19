@@ -3,6 +3,7 @@ package db
 import (
 	"bytes"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -143,5 +144,45 @@ func TestDBDeleteOverridesSST(t *testing.T) {
 	}
 	if ok || v != nil {
 		t.Fatalf("expected mem tombstone to override SST value, got ok=%v v=%v", ok, v)
+	}
+}
+
+func TestDBConcurrentPuts(t *testing.T) {
+	dir := t.TempDir()
+	dbDir := filepath.Join(dir, "data")
+
+	d, err := Open(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+
+	const total = 64
+
+	var wg sync.WaitGroup
+	wg.Add(total)
+	for i := 0; i < total; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			if err := d.Put(k(i), v(i)); err != nil {
+				t.Errorf("put %s failed: %v", k(i), err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if err := d.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < total; i++ {
+		got, ok, err := d.Get(k(i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok || !bytes.Equal(got, v(i)) {
+			t.Fatalf("want %s=%q, ok=%v got=%q", k(i), v(i), ok, got)
+		}
 	}
 }

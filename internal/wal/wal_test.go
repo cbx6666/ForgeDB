@@ -51,3 +51,40 @@ func TestWALAppendAndReplay(t *testing.T) {
 		t.Fatalf("unexpected record[2]: %+v", records[2])
 	}
 }
+
+func TestWALAppendBatchAndReplay(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "forge.wal")
+
+	w, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+
+	err = w.AppendBatch([]Record{
+		{Op: opPut, Key: "a", Value: []byte("1")},
+		{Op: opPut, Key: "b", Value: []byte("2")},
+		{Op: opDelete, Key: "a"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	records, err := Replay(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 3 {
+		t.Fatalf("expected 3 records, got %d", len(records))
+	}
+	if records[0].Key != "a" || !bytes.Equal(records[0].Value, []byte("1")) {
+		t.Fatalf("unexpected record[0]: %+v", records[0])
+	}
+	if records[1].Key != "b" || !bytes.Equal(records[1].Value, []byte("2")) {
+		t.Fatalf("unexpected record[1]: %+v", records[1])
+	}
+	if records[2].Op != opDelete || records[2].Key != "a" {
+		t.Fatalf("unexpected record[2]: %+v", records[2])
+	}
+}
