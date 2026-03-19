@@ -325,6 +325,74 @@ func TestDB_Reopen_RecoversFlushWALAndActiveWAL(t *testing.T) {
 	}
 }
 
+// 3.1) white-box crash simulation: SST 已经写出，但 install 前崩溃；重启后仍应以两份 WAL 为准恢复。
+func TestDB_Reopen_RecoversWhenFlushSSTExistsButInstallNotDone(t *testing.T) {
+	dir := t.TempDir()
+
+	d, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := d.Put("old", []byte("v-old")); err != nil {
+		_ = d.Close()
+		t.Fatal(err)
+	}
+
+	d.mu.Lock()
+	job, err := d.prepareFlushLocked()
+	d.mu.Unlock()
+	if err != nil {
+		_ = d.Close()
+		t.Fatal(err)
+	}
+	if job == nil {
+		_ = d.Close()
+		t.Fatal("prepareFlushLocked returned nil job")
+	}
+
+	if err := d.Put("new", []byte("v-new")); err != nil {
+		_ = d.Close()
+		t.Fatal(err)
+	}
+
+	if err := d.doFlush(job); err != nil {
+		_ = d.Close()
+		t.Fatal(err)
+	}
+	if !fileExists(job.path) {
+		_ = d.Close()
+		t.Fatalf("expected flushed sst exists before simulated crash: %s", job.path)
+	}
+
+	// 模拟崩溃：SST 已经落盘，但 manifest/version 尚未安装。
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	d2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d2.Close() }()
+
+	gotOld, okOld, err := d2.Get("old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !okOld || string(gotOld) != "v-old" {
+		t.Fatalf("want old=v-old after reopen, ok=%v got=%q", okOld, string(gotOld))
+	}
+
+	gotNew, okNew, err := d2.Get("new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !okNew || string(gotNew) != "v-new" {
+		t.Fatalf("want new=v-new after reopen, ok=%v got=%q", okNew, string(gotNew))
+	}
+}
+
 // 4) sanity: 多次 Flush 后 imm 不残留、L0 递增、读语义正确
 func TestDB_MultipleFlushes_NoImmLeakAndReadsCorrect(t *testing.T) {
 	dir := t.TempDir()

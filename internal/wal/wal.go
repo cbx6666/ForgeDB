@@ -49,9 +49,14 @@ func (w *WAL) Close() error {
 
 	if w.buf != nil {
 		// 防止还有残留数据在内存里没写出去
-		_ = w.buf.Flush()
+		if err := w.buf.Flush(); err != nil {
+			return err
+		}
 	}
 	if w.f != nil {
+		if err := w.f.Sync(); err != nil {
+			return err
+		}
 		return w.f.Close()
 	}
 	return nil
@@ -171,9 +176,15 @@ func Replay(path string) ([]Record, error) {
 		var keyLen uint32
 		var valLen uint32
 		if err := binary.Read(r, binary.LittleEndian, &keyLen); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return out, nil
+			}
 			return nil, ErrCorruptWAL
 		}
 		if err := binary.Read(r, binary.LittleEndian, &valLen); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return out, nil
+			}
 			return nil, ErrCorruptWAL
 		}
 
@@ -181,6 +192,9 @@ func Replay(path string) ([]Record, error) {
 		keyB := make([]byte, keyLen)
 		// io.ReadFull(r,keyB)：必须把 keyB 填满，否则就返回错误
 		if _, err := io.ReadFull(r, keyB); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return out, nil
+			}
 			return nil, ErrCorruptWAL
 		}
 
@@ -189,6 +203,9 @@ func Replay(path string) ([]Record, error) {
 		if valLen > 0 {
 			valB = make([]byte, valLen)
 			if _, err = io.ReadFull(r, valB); err != nil {
+				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+					return out, nil
+				}
 				return nil, ErrCorruptWAL
 			}
 		}

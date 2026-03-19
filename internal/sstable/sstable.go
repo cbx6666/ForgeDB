@@ -140,7 +140,10 @@ func WriteTable(path string, entries []types.Entry) error {
 		return err
 	}
 
-	return w.Flush()
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 // Get 从 SSTable 文件中查找 key。

@@ -2,6 +2,7 @@ package wal
 
 import (
 	"bytes"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -86,5 +87,51 @@ func TestWALAppendBatchAndReplay(t *testing.T) {
 	}
 	if records[2].Op != opDelete || records[2].Key != "a" {
 		t.Fatalf("unexpected record[2]: %+v", records[2])
+	}
+}
+
+func TestWALReplay_TruncatedTailRecordIgnored(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "forge.wal")
+
+	w, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = w.AppendBatch([]Record{
+		{Op: opPut, Key: "a", Value: []byte("1")},
+		{Op: opPut, Key: "b", Value: []byte("23456")},
+	})
+	if err != nil {
+		_ = w.Close()
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) < 3 {
+		t.Fatalf("unexpected wal size: %d", len(data))
+	}
+
+	// 模拟崩溃时最后一条记录只写了一半，回放应保留前面的完整记录。
+	if err := os.WriteFile(path, data[:len(data)-3], 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	records, err := Replay(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected 1 intact record after truncation, got %d", len(records))
+	}
+	if records[0].Op != opPut || records[0].Key != "a" || !bytes.Equal(records[0].Value, []byte("1")) {
+		t.Fatalf("unexpected record[0]: %+v", records[0])
 	}
 }
