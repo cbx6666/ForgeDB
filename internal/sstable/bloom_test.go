@@ -42,15 +42,13 @@ func TestBloomSkipsCorruptIndexOnMiss(t *testing.T) {
 	}
 	fileSize := st.Size()
 
-	indexStartOffset, bloomStartOffset, err := loadFooter(f, fileSize)
+	indexStartOffset, bloomStartOffset, metaStartOffset, err := loadFooter(f, fileSize)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	footerStart := uint64(fileSize) - uint64(footerSize)
-
 	// 读取 bloom 区，反序列化
-	br := io.NewSectionReader(f, int64(bloomStartOffset), int64(footerStart-bloomStartOffset))
+	br := io.NewSectionReader(f, int64(bloomStartOffset), int64(metaStartOffset-bloomStartOffset))
 	bloomBytes, err := io.ReadAll(br)
 	if err != nil {
 		t.Fatal(err)

@@ -25,7 +25,7 @@ type indexEntry struct {
 // loadIndex 尝试从文件尾部加载索引。
 // 返回：entries, indexOffset, err
 func loadIndex(f *os.File, fileSize int64) ([]indexEntry, uint64, error) {
-	indexStartOffset, _, err := loadFooter(f, fileSize)
+	indexStartOffset, _, _, err := loadFooter(f, fileSize)
 	if err != nil {
 		return nil, 0, err
 	}

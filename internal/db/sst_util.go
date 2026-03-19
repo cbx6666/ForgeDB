@@ -149,27 +149,12 @@ func parseSSTID(path string) (uint64, bool) {
 }
 
 func sstKeyRange(path string) (min, max string, err error) {
-	it, err := sstable.NewIter(path)
-	if err != nil {
-		return "", "", err
-	}
-	defer it.Close()
-
-	if !it.Valid() {
-		return "", "", nil
-	}
-	min = it.Entry().Key
-	max = min
-	for it.Valid() {
-		max = it.Entry().Key
-		if err := it.Next(); err != nil {
-			return "", "", err
-		}
-	}
-	return min, max, nil
+	// 新版 SST 会直接持久化 min/max，这里不再通过全表迭代计算范围。
+	return sstable.LoadBounds(path)
 }
 
 func rangeOfFiles(paths []string) (minK, maxK string, err error) {
+	// 聚合多张 SST 的整体 key 范围，供 overlap 判断和 compaction 选任务使用。
 	first := true
 	for _, p := range paths {
 		a, b, err := sstKeyRange(p)
@@ -293,6 +278,7 @@ func (d *DB) writeSingleRun(dstLevel int, entries []types.Entry) (levelFile, str
 		return levelFile{}, "", nil
 	}
 
+	// 先在锁下分配文件 ID，并拿到目标层目录。
 	d.mu.Lock()
 	id := d.nextID
 	d.nextID++
@@ -303,6 +289,7 @@ func (d *DB) writeSingleRun(dstLevel int, entries []types.Entry) (levelFile, str
 	finalPath := filepath.Join(dstDir, name)
 	tmpPath := finalPath + ".tmp"
 
+	// 先写临时文件，再 rename 成正式文件，避免留下半成品 SST。
 	if err := sstable.WriteTable(tmpPath, entries); err != nil {
 		_ = os.Remove(tmpPath)
 		return levelFile{}, "", err
@@ -316,6 +303,7 @@ func (d *DB) writeSingleRun(dstLevel int, entries []types.Entry) (levelFile, str
 		return levelFile{}, "", err
 	}
 
+	// 这里返回的 min/max 与写入 SST 的 bounds 元信息保持一致。
 	return levelFile{
 		id:     id,
 		path:   finalPath,

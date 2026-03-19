@@ -9,12 +9,14 @@ import (
 	"sync"
 )
 
-// TableMeta 表示单个 SSTable 解析后的元信息。
-// 它只缓存 footer / bloom / 稀疏索引，不持有打开中的文件句柄。
+// TableMeta 表示单个 SST 解析后的表级元信息。
+// 这里缓存 footer、bloom、key 范围和稀疏索引，但不持有打开中的文件句柄。
 type TableMeta struct {
 	mu               sync.Mutex
 	path             string
 	indexStartOffset uint64
+	minKey           string
+	maxKey           string
 	bloom            *bloom
 	index            []indexEntry
 	indexLoaded      bool
@@ -39,28 +41,27 @@ func openTableMeta(path string) (*TableMeta, error) {
 		return nil, ErrCorruptSST
 	}
 
-	// 2) 读 count，主要用于保持文件格式校验逻辑完整。
+	// 2) 读 count，迭代器依赖它判断 record 数量，这里也顺带完成格式校验。
 	var count uint32
 	if err := binary.Read(r, binary.LittleEndian, &count); err != nil {
 		return nil, ErrCorruptSST
 	}
 	_ = count
 
-	// 3) footer 里保存了 index/bloom 的边界偏移。
+	// 3) footer 里保存了 index、bloom、meta 三个区域的边界偏移。
 	st, err := f.Stat()
 	if err != nil {
 		return nil, err
 	}
 	fileSize := st.Size()
 
-	indexStartOffset, bloomStartOffset, err := loadFooter(f, fileSize)
+	indexStartOffset, bloomStartOffset, metaStartOffset, err := loadFooter(f, fileSize)
 	if err != nil {
 		return nil, err
 	}
 
-	// 4) bloom 会被常用到，直接一次性读入内存。
-	footerStart := uint64(fileSize) - uint64(footerSize)
-	br := io.NewSectionReader(f, int64(bloomStartOffset), int64(footerStart-bloomStartOffset))
+	// 4) bloom 是热点元信息，初始化时就直接读入内存。
+	br := io.NewSectionReader(f, int64(bloomStartOffset), int64(metaStartOffset-bloomStartOffset))
 	bloomBytes, err := io.ReadAll(br)
 	if err != nil {
 		return nil, err
@@ -71,9 +72,17 @@ func openTableMeta(path string) (*TableMeta, error) {
 		return nil, ErrCorruptSST
 	}
 
+	// 5) 读取表级 key 范围，避免 DB 层再通过全表扫描求 min/max。
+	minKey, maxKey, err := loadBounds(f, fileSize)
+	if err != nil {
+		return nil, err
+	}
+
 	return &TableMeta{
 		path:             path,
 		indexStartOffset: indexStartOffset,
+		minKey:           minKey,
+		maxKey:           maxKey,
 		bloom:            bf,
 	}, nil
 }
@@ -89,7 +98,7 @@ func (tm *TableMeta) Get(key string) ([]byte, GetResult, error) {
 		return nil, NotFound, err
 	}
 
-	// 元信息常驻内存，但数据区读取仍然按次打开文件。
+	// 元信息常驻内存，但真正的数据区仍然按次打开文件读取。
 	f, err := os.Open(tm.path)
 	if err != nil {
 		return nil, NotFound, err
@@ -147,7 +156,7 @@ func (tm *TableMeta) Get(key string) ([]byte, GetResult, error) {
 			return valB, Found, nil
 		}
 		if k > key {
-			// SST 内部有序；一旦超过目标 key，就可以提前结束。
+			// SST 内部按 key 有序；一旦超过目标 key，就可以提前结束。
 			return nil, NotFound, nil
 		}
 	}
@@ -191,8 +200,8 @@ func (tm *TableMeta) ensureIndex() error {
 	return tm.indexErr
 }
 
-// TableCache 缓存 SSTable 的元信息。
-// 这里只缓存 footer / bloom / index，不缓存文件句柄，
+// TableCache 缓存 SST 的表级元信息。
+// 这里只缓存 footer、bloom、key 范围和稀疏索引，不缓存文件句柄，
 // 这样可以减少重复解析开销，又不会把文件删除语义变复杂。
 type TableCache struct {
 	mu     sync.Mutex

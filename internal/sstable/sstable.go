@@ -129,11 +129,41 @@ func WriteTable(path string, entries []types.Entry) error {
 		return err
 	}
 
+	// 写入表级 key 范围，供恢复和 compaction 直接读取。
+	metaStartOffset := w.n
+	minKey := ""
+	maxKey := ""
+	if len(entries) > 0 {
+		minKey = entries[0].Key
+		maxKey = entries[len(entries)-1].Key
+	}
+	minKeyBytes := []byte(minKey)
+	maxKeyBytes := []byte(maxKey)
+	if err := binary.Write(w, binary.LittleEndian, uint32(len(minKeyBytes))); err != nil {
+		return err
+	}
+	if len(minKeyBytes) > 0 {
+		if _, err := w.Write(minKeyBytes); err != nil {
+			return err
+		}
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint32(len(maxKeyBytes))); err != nil {
+		return err
+	}
+	if len(maxKeyBytes) > 0 {
+		if _, err := w.Write(maxKeyBytes); err != nil {
+			return err
+		}
+	}
+
 	// footer
 	if err := binary.Write(w, binary.LittleEndian, indexStartOffset); err != nil {
 		return err
 	}
 	if err := binary.Write(w, binary.LittleEndian, bloomStartOffset); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, metaStartOffset); err != nil {
 		return err
 	}
 
