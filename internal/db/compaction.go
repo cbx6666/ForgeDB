@@ -142,19 +142,117 @@ func (d *DB) doCompaction(job *compactionJob) (*compactionResult, error) {
 	inputs = append(inputs, job.srcPaths...)
 	inputs = append(inputs, job.dstPaths...)
 
-	merged, err := mergeIters(inputs)
-	if err != nil {
-		return nil, err
-	}
-	if len(merged) == 0 {
-		return &compactionResult{job: job, newRuns: nil}, nil
-	}
-
-	newRuns, _, err := d.writeRuns(job.level+1, merged)
+	// 目标层已经是最高层时，后面不再有更老的数据需要被 tombstone 遮蔽，
+	// 因此可以在这次 compaction 中直接丢弃删除标记。
+	dropBottomTombstones := job.level+1 == d.opt.numLevels-1
+	newRuns, _, err := d.streamCompactionRuns(job.level+1, inputs, dropBottomTombstones)
 	if err != nil {
 		return nil, err
 	}
 	return &compactionResult{job: job, newRuns: newRuns}, nil
+}
+
+func (d *DB) streamCompactionRuns(dstLevel int, inputs []string, dropBottomTombstones bool) ([]levelFile, []string, error) {
+	runMax := d.opt.levels[dstLevel].runMaxEntries
+	if runMax <= 0 {
+		return nil, nil, nil
+	}
+
+	h := &mergeHeap{}
+	heap.Init(h)
+
+	var iters []*sstable.Iter
+	defer func() {
+		for _, it := range iters {
+			_ = it.Close()
+		}
+	}()
+
+	for prio, path := range inputs {
+		// 为每个输入 SST 打开顺序迭代器，并按输入顺序记录优先级。
+		// priority 越小，表示这一路输入越“新”，同 key 去重时应优先保留。
+		it, err := sstable.NewIter(path)
+		if err != nil {
+			return nil, nil, err
+		}
+		iters = append(iters, it)
+		if it.Valid() {
+			heap.Push(h, heapItem{it: it, ent: it.Entry(), priority: prio})
+		}
+	}
+
+	outRuns := make([]levelFile, 0, len(inputs))
+	created := make([]string, 0, len(inputs))
+	chunk := make([]types.Entry, 0, runMax)
+
+	cleanupCreated := func() {
+		// 一旦中途失败，删除已经写出的 compaction 产物，避免留下孤儿文件。
+		for _, p := range created {
+			_ = removeFileAndSync(p)
+		}
+	}
+
+	flushChunk := func() error {
+		if len(chunk) == 0 {
+			return nil
+		}
+		// 这里的 chunk 大小已经被 runMax 限住了，因此只需要写一个 run。
+		// 流式 compaction 自己负责分段，底层只保留“写单个 run”的职责。
+		run, made, err := d.writeSingleRun(dstLevel, chunk)
+		if err != nil {
+			cleanupCreated()
+			return err
+		}
+		outRuns = append(outRuns, run)
+		created = append(created, made)
+		chunk = chunk[:0]
+		return nil
+	}
+
+	emit := func(ent types.Entry) error {
+		// 到达最高层时，墓碑已经不需要再向下传播，可以直接丢弃。
+		if dropBottomTombstones && ent.Tombstone {
+			return nil
+		}
+		chunk = append(chunk, ent)
+		if len(chunk) < runMax {
+			return nil
+		}
+		return flushChunk()
+	}
+
+	var lastKey string
+	hasLast := false
+
+	for h.Len() > 0 {
+		// 每次取出当前全局最小 key；若 key 相同，则由 heap 的 priority 保证“较新的输入先出堆”。
+		item := heap.Pop(h).(heapItem)
+
+		if !hasLast || item.ent.Key != lastKey {
+			// 只在遇到一个新 key 时输出一次，从而完成跨文件去重。
+			if err := emit(item.ent); err != nil {
+				return nil, nil, err
+			}
+			lastKey = item.ent.Key
+			hasLast = true
+		}
+
+		// 推进当前迭代器，并把它的下一个候选项重新放回堆中，继续多路归并。
+		if err := item.it.Next(); err != nil {
+			cleanupCreated()
+			return nil, nil, err
+		}
+		if item.it.Valid() {
+			item.ent = item.it.Entry()
+			heap.Push(h, item)
+		}
+	}
+
+	// 刷出最后一个未满的分段。
+	if err := flushChunk(); err != nil {
+		return nil, nil, err
+	}
+	return outRuns, created, nil
 }
 
 func (d *DB) installCompactionLocked(res *compactionResult) error {
@@ -232,54 +330,6 @@ func (d *DB) installCompactionLocked(res *compactionResult) error {
 	d.clearPendingLocked(all)
 
 	return nil
-}
-
-func mergeIters(paths []string) ([]types.Entry, error) {
-	h := &mergeHeap{}
-	heap.Init(h)
-
-	var iters []*sstable.Iter
-	defer func() {
-		for _, it := range iters {
-			_ = it.Close()
-		}
-	}()
-
-	for prio, path := range paths {
-		it, err := sstable.NewIter(path)
-		if err != nil {
-			return nil, err
-		}
-		iters = append(iters, it)
-		if it.Valid() {
-			heap.Push(h, heapItem{it: it, ent: it.Entry(), priority: prio})
-		}
-	}
-
-	merged := make([]types.Entry, 0, 1024)
-	var lastKey string
-	hasLast := false
-
-	for h.Len() > 0 {
-		item := heap.Pop(h).(heapItem)
-
-		// 同 key 只保留最先弹出的（priority 最小那条）
-		if !hasLast || item.ent.Key != lastKey {
-			merged = append(merged, item.ent)
-			lastKey = item.ent.Key
-			hasLast = true
-		}
-
-		if err := item.it.Next(); err != nil {
-			return nil, err
-		}
-		if item.it.Valid() {
-			item.ent = item.it.Entry()
-			heap.Push(h, item)
-		}
-	}
-
-	return merged, nil
 }
 
 func (d *DB) pickCompactionLevelLocked() (int, bool) {

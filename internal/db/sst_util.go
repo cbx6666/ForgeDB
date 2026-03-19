@@ -205,6 +205,12 @@ func pickOldestL0(l0 []string, n int, skip func(string) bool) (picked, remain []
 		picked = append(picked, p)
 	}
 
+	// picked 是从旧到新挑出来的；返回前翻转成“较新的在前”，
+	// 这样 compaction 在去重时仍然保持“新值覆盖旧值”。
+	for i, j := 0, len(picked)-1; i < j; i, j = i+1, j-1 {
+		picked[i], picked[j] = picked[j], picked[i]
+	}
+
 	if len(picked) == 0 {
 		return nil, remain
 	}
@@ -282,6 +288,42 @@ func overlappedRuns(files []levelFile, minK, maxK string) (idx []int) {
 	return idx
 }
 
+func (d *DB) writeSingleRun(dstLevel int, entries []types.Entry) (levelFile, string, error) {
+	if len(entries) == 0 {
+		return levelFile{}, "", nil
+	}
+
+	d.mu.Lock()
+	id := d.nextID
+	d.nextID++
+	dstDir := d.currentVersion().levels[dstLevel].dir
+	d.mu.Unlock()
+
+	name := fmt.Sprintf("%06d.sst", id)
+	finalPath := filepath.Join(dstDir, name)
+	tmpPath := finalPath + ".tmp"
+
+	if err := sstable.WriteTable(tmpPath, entries); err != nil {
+		_ = os.Remove(tmpPath)
+		return levelFile{}, "", err
+	}
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return levelFile{}, "", err
+	}
+	if err := syncPathDir(finalPath); err != nil {
+		_ = os.Remove(finalPath)
+		return levelFile{}, "", err
+	}
+
+	return levelFile{
+		id:     id,
+		path:   finalPath,
+		minKey: entries[0].Key,
+		maxKey: entries[len(entries)-1].Key,
+	}, finalPath, nil
+}
+
 func (d *DB) writeRuns(dstLevel int, merged []types.Entry) ([]levelFile, []string, error) {
 	if len(merged) == 0 {
 		return nil, nil, nil
@@ -301,46 +343,17 @@ func (d *DB) writeRuns(dstLevel int, merged []types.Entry) ([]levelFile, []strin
 		}
 		chunk := merged[i:j]
 
-		d.mu.Lock()
-		id := d.nextID
-		d.nextID++
-		dstDir := d.currentVersion().levels[dstLevel].dir
-		d.mu.Unlock()
-
-		name := fmt.Sprintf("%06d.sst", id)
-		finalPath := filepath.Join(dstDir, name)
-		tmpPath := finalPath + ".tmp"
-
-		if err := sstable.WriteTable(tmpPath, chunk); err != nil {
-			_ = os.Remove(tmpPath)
+		run, path, err := d.writeSingleRun(dstLevel, chunk)
+		if err != nil {
 			// 清理已创建的 run
 			for _, p := range created {
 				_ = os.Remove(p)
 			}
 			return nil, nil, err
 		}
-		if err := os.Rename(tmpPath, finalPath); err != nil {
-			_ = os.Remove(tmpPath)
-			for _, p := range created {
-				_ = os.Remove(p)
-			}
-			return nil, nil, err
-		}
-		if err := syncPathDir(finalPath); err != nil {
-			_ = os.Remove(finalPath)
-			for _, p := range created {
-				_ = os.Remove(p)
-			}
-			return nil, nil, err
-		}
 
-		created = append(created, finalPath)
-		newRuns = append(newRuns, levelFile{
-			id:     id,
-			path:   finalPath,
-			minKey: chunk[0].Key,
-			maxKey: chunk[len(chunk)-1].Key,
-		})
+		created = append(created, path)
+		newRuns = append(newRuns, run)
 
 		i = j
 	}

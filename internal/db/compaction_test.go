@@ -289,6 +289,127 @@ func TestDB_KeepsNewestValue(t *testing.T) {
 	assertInvariantsLocked(t, d)
 }
 
+func TestDB_Compaction_KeepsNewestValueAcrossL0(t *testing.T) {
+	dir := t.TempDir()
+
+	opt := defaultOptions()
+	opt.numLevels = 2
+	opt.levels = []LevelOptions{
+		{maxFiles: 2, pickN: 2, runMaxEntries: 0},
+		{maxFiles: 0, pickN: 0, runMaxEntries: 64},
+	}
+
+	d, err := OpenWithOptions(dir, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+
+	if err := d.Put("A", []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Put("A", []byte("2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Put("B", []byte("3")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := d.RequestCompaction(); err != nil {
+		t.Fatal(err)
+	}
+
+	waitUntil(
+		t,
+		3*time.Second,
+		10*time.Millisecond,
+		func() bool {
+			s := snapshotLevels(d)
+			return s.l1 > 0
+		},
+		func() string {
+			s := snapshotLevels(d)
+			return fmt.Sprintf("expected L1>0 eventually, got L0=%d L1=%d", s.l0, s.l1)
+		},
+	)
+
+	got, ok, err := d.Get("A")
+	if err != nil || !ok || string(got) != "2" {
+		t.Fatalf("want A=2 after compaction, ok=%v v=%q err=%v", ok, string(got), err)
+	}
+}
+
+func TestDB_Compaction_DropsBottomLevelTombstones(t *testing.T) {
+	dir := t.TempDir()
+
+	opt := defaultOptions()
+	opt.numLevels = 2
+	opt.levels = []LevelOptions{
+		{maxFiles: 2, pickN: 2, runMaxEntries: 0},
+		{maxFiles: 0, pickN: 0, runMaxEntries: 64},
+	}
+
+	d, err := OpenWithOptions(dir, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+
+	if err := d.Put("A", []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Delete("A"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Put("B", []byte("2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := d.RequestCompaction(); err != nil {
+		t.Fatal(err)
+	}
+
+	waitUntil(
+		t,
+		3*time.Second,
+		10*time.Millisecond,
+		func() bool {
+			s := snapshotLevels(d)
+			return s.l0 == 1 && s.l1 == 0
+		},
+		func() string {
+			s := snapshotLevels(d)
+			return fmt.Sprintf("expected tombstone-only compaction to leave L0=1 L1=0, got L0=%d L1=%d", s.l0, s.l1)
+		},
+	)
+
+	if _, ok, err := d.Get("A"); err != nil || ok {
+		t.Fatalf("A should remain deleted after bottom compaction, ok=%v err=%v", ok, err)
+	}
+	got, ok, err := d.Get("B")
+	if err != nil || !ok || string(got) != "2" {
+		t.Fatalf("want B=2 after compaction, ok=%v v=%q err=%v", ok, string(got), err)
+	}
+}
+
 // 3) 针对后台 compaction：触发阈值后，最终应完成 L0->L1，并满足 L1 不变式
 func TestDB_BackgroundCompaction_EventuallyL0ToL1(t *testing.T) {
 	dir := t.TempDir()
