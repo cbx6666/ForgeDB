@@ -35,6 +35,21 @@ type Options struct {
 	walSyncInterval time.Duration
 }
 
+// DefaultOptions 返回一份可供调用方修改的默认配置副本。
+func DefaultOptions() Options {
+	return defaultOptions()
+}
+
+// WithWALSync 返回一份带有 WAL sync 策略的新配置。
+// 对 WALSyncInterval，interval 必须大于 0；其他模式下该值会被忽略。
+func (opt Options) WithWALSync(mode WALSyncMode, interval time.Duration) Options {
+	opt.walSync = mode
+	if mode == WALSyncInterval && interval > 0 {
+		opt.walSyncInterval = interval
+	}
+	return opt
+}
+
 func defaultOptions() Options {
 	return Options{
 		numLevels: 3,
