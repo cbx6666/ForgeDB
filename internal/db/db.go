@@ -61,8 +61,8 @@ type DB struct {
 	writeSeq  uint64
 	syncedSeq uint64
 
-	// bg compaction
-	mu   sync.Mutex
+	// bg compaction / shared db state
+	mu   sync.RWMutex
 	cond *sync.Cond
 	wg   sync.WaitGroup
 
@@ -303,15 +303,15 @@ func (d *DB) Write(batch *WriteBatch) error {
 }
 
 func (d *DB) Get(key string) ([]byte, bool, error) {
-	d.mu.Lock()
+	d.mu.RLock()
 	if err := d.checkBGErrLocked(); err != nil {
-		d.mu.Unlock()
+		d.mu.RUnlock()
 		return nil, false, err
 	}
 
 	// 1) MemTable
 	if e, ok := d.mem.GetAll(key); ok {
-		d.mu.Unlock()
+		d.mu.RUnlock()
 		if e.Tombstone {
 			return nil, false, nil
 		}
@@ -321,7 +321,7 @@ func (d *DB) Get(key string) ([]byte, bool, error) {
 	// 2) immutable MemTable (flush in progress)
 	if d.imm != nil {
 		if e, ok := d.imm.GetAll(key); ok {
-			d.mu.Unlock()
+			d.mu.RUnlock()
 			if e.Tombstone {
 				return nil, false, nil
 			}
@@ -333,7 +333,7 @@ func (d *DB) Get(key string) ([]byte, bool, error) {
 	view := readView{
 		version: d.currentVersion(),
 	}
-	d.mu.Unlock()
+	d.mu.RUnlock()
 
 	levels := view.version.levels
 

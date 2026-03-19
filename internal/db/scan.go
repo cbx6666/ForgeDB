@@ -103,8 +103,8 @@ func (d *DB) NewIterator(start, end string) (*Iterator, error) {
 }
 
 func (d *DB) captureScanSnapshot(start, end string) ([]types.Entry, []types.Entry, readView, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 
 	if err := d.checkBGErrLocked(); err != nil {
 		return nil, nil, readView{}, err
