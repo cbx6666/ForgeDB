@@ -7,6 +7,7 @@ import (
 
 // db_options_test.go 验证默认选项和链式配置接口的行为。
 
+// TestDefaultOptions_UsesNeverSyncByDefault 验证默认配置采用 NeverSync。
 func TestDefaultOptions_UsesNeverSyncByDefault(t *testing.T) {
 	opt := DefaultOptions()
 
@@ -18,6 +19,7 @@ func TestDefaultOptions_UsesNeverSyncByDefault(t *testing.T) {
 	}
 }
 
+// TestOptionsWithWALSync_ConfiguresIntervalMode 验证 interval 模式会记录给定同步周期。
 func TestOptionsWithWALSync_ConfiguresIntervalMode(t *testing.T) {
 	opt := DefaultOptions().WithWALSync(WALSyncInterval, 25*time.Millisecond)
 
@@ -29,6 +31,7 @@ func TestOptionsWithWALSync_ConfiguresIntervalMode(t *testing.T) {
 	}
 }
 
+// TestOptionsWithWALSync_KeepsExistingIntervalForNonIntervalMode 验证切到非 interval 模式时保留原周期。
 func TestOptionsWithWALSync_KeepsExistingIntervalForNonIntervalMode(t *testing.T) {
 	base := DefaultOptions().WithWALSync(WALSyncInterval, 25*time.Millisecond)
 	opt := base.WithWALSync(WALSyncEveryBatch, time.Second)
@@ -41,6 +44,7 @@ func TestOptionsWithWALSync_KeepsExistingIntervalForNonIntervalMode(t *testing.T
 	}
 }
 
+// TestOptionsWithAutoFlushBytes_ConfiguresThreshold 验证自动 flush 阈值配置会生效。
 func TestOptionsWithAutoFlushBytes_ConfiguresThreshold(t *testing.T) {
 	opt := DefaultOptions().WithAutoFlushBytes(4096)
 

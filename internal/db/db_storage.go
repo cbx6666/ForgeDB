@@ -307,6 +307,7 @@ func removeFileAndSync(path string) error {
 	return syncPathDir(path)
 }
 
+// isDirSyncUnsupported 判断目录同步失败是否属于平台不支持场景。
 func isDirSyncUnsupported(err error) bool {
 	if err == nil {
 		return false
@@ -328,6 +329,7 @@ func isDirSyncUnsupported(err error) bool {
 	return strings.Contains(msg, "not supported") || strings.Contains(msg, "incorrect function")
 }
 
+// isTransientRemoveErr 判断删除失败是否属于可重试的临时性错误。
 func isTransientRemoveErr(err error) bool {
 	if err == nil || runtime.GOOS != "windows" {
 		return false
@@ -345,6 +347,7 @@ func isTransientRemoveErr(err error) bool {
 	return strings.Contains(msg, "being used by another process") || strings.Contains(msg, "access is denied")
 }
 
+// listAllSSTFiles 遍历 sst 目录并收集所有 SST 文件路径。
 func listAllSSTFiles(sstDir string) ([]string, error) {
 	var out []string
 	err := filepath.WalkDir(sstDir, func(path string, d fs.DirEntry, err error) error {
@@ -362,6 +365,7 @@ func listAllSSTFiles(sstDir string) ([]string, error) {
 	return out, err
 }
 
+// referencedSSTSet 构建当前版本引用到的 SST 文件集合。
 func referencedSSTSet(levels []level) map[string]struct{} {
 	set := make(map[string]struct{}, 1024)
 	for li := range levels {
@@ -379,6 +383,7 @@ func referencedSSTSet(levels []level) map[string]struct{} {
 	return set
 }
 
+// findOrphanSST 找出磁盘上存在但当前版本未引用的 SST 文件。
 func findOrphanSST(all []string, ref map[string]struct{}) []string {
 	var orphan []string
 	for _, p := range all {
@@ -389,10 +394,12 @@ func findOrphanSST(all []string, ref map[string]struct{}) []string {
 	return orphan
 }
 
+// removePaths 从路径切片中移除指定路径集合。
 func removePaths(all []string, del []string) []string {
 	if len(del) == 0 {
 		return all
 	}
+	// 先把待删除路径放进集合，再线性过滤原切片。
 	set := make(map[string]struct{}, len(del))
 	for _, p := range del {
 		set[p] = struct{}{}
@@ -406,10 +413,12 @@ func removePaths(all []string, del []string) []string {
 	return out
 }
 
+// removeRunsByPaths 从 run 切片中移除指定路径对应的文件。
 func removeRunsByPaths(all []levelFile, del []string) []levelFile {
 	if len(del) == 0 {
 		return all
 	}
+	// 只按 path 匹配删除，避免误依赖 levelFile 的整体相等性。
 	set := make(map[string]struct{}, len(del))
 	for _, p := range del {
 		set[p] = struct{}{}
@@ -423,6 +432,7 @@ func removeRunsByPaths(all []levelFile, del []string) []levelFile {
 	return out
 }
 
+// parseSSTID 从 SST 文件名中解析数值编号。
 func parseSSTID(path string) (uint64, bool) {
 	base := filepath.Base(path)
 	name := strings.TrimSuffix(base, ".sst")
@@ -433,10 +443,12 @@ func parseSSTID(path string) (uint64, bool) {
 	return id, true
 }
 
+// sstKeyRange 读取单张 SST 的最小和最大 key。
 func sstKeyRange(path string) (min, max string, err error) {
 	return sstable.LoadBounds(path)
 }
 
+// rangeOfFiles 计算一组 SST 文件覆盖的整体 key 范围。
 func rangeOfFiles(paths []string) (minK, maxK string, err error) {
 	first := true
 	for _, p := range paths {
@@ -459,12 +471,14 @@ func rangeOfFiles(paths []string) (minK, maxK string, err error) {
 	return minK, maxK, nil
 }
 
+// pickOldestL0 从 L0 中按最老优先规则挑选输入文件。
 func pickOldestL0(l0 []string, n int, skip func(string) bool) (picked, remain []string) {
 	remain = make([]string, 0, len(l0))
 	picked = make([]string, 0, n)
 
 	remain = append(remain, l0...)
 
+	// L0 在内存里是 newest-first，因此从尾部开始挑就是“最老优先”。
 	for i := len(l0) - 1; i >= 0 && len(picked) < n; i-- {
 		p := l0[i]
 		if skip != nil && skip(p) {
@@ -480,6 +494,7 @@ func pickOldestL0(l0 []string, n int, skip func(string) bool) (picked, remain []
 	if len(picked) == 0 {
 		return nil, remain
 	}
+	// picked 确定后，再从原列表中剔除它们，得到 remain。
 	set := make(map[string]struct{}, len(picked))
 	for _, p := range picked {
 		set[p] = struct{}{}
@@ -494,11 +509,13 @@ func pickOldestL0(l0 []string, n int, skip func(string) bool) (picked, remain []
 	return
 }
 
+// pickOldestRuns 从有序 runs 中按最老优先规则挑选输入文件。
 func pickOldestRuns(files []levelFile, n int, skip func(string) bool) (picked, remain []levelFile) {
 	idx := make([]int, 0, len(files))
 	for i := range files {
 		idx = append(idx, i)
 	}
+	// 按文件 id 从老到新挑选，保持较稳定的 compaction 顺序。
 	sort.Slice(idx, func(i, j int) bool { return files[idx[i]].id < files[idx[j]].id })
 
 	pickedSet := make(map[int]struct{}, n)
@@ -561,6 +578,7 @@ func (d *DB) writeSingleRun(dstLevel int, entries []types.Entry) (levelFile, str
 	}
 
 	d.mu.Lock()
+	// 先分配全局文件号，再在锁外真正写 SST，避免长时间持锁。
 	id := d.nextID
 	d.nextID++
 	dstDir := d.currentVersion().levels[dstLevel].dir
@@ -570,6 +588,7 @@ func (d *DB) writeSingleRun(dstLevel int, entries []types.Entry) (levelFile, str
 	finalPath := filepath.Join(dstDir, name)
 	tmpPath := finalPath + ".tmp"
 
+	// 仍然采用“先写 tmp，再 rename”为最终文件的模式，避免留下半成品 SST。
 	if err := sstable.WriteTable(tmpPath, entries); err != nil {
 		_ = os.Remove(tmpPath)
 		return levelFile{}, "", err

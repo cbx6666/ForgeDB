@@ -60,6 +60,7 @@ func (opt Options) WithAutoFlushBytes(bytes int) Options {
 	return opt
 }
 
+// defaultOptions 返回内部使用的默认配置模板。
 func defaultOptions() Options {
 	return Options{
 		numLevels: 3,
@@ -74,6 +75,7 @@ func defaultOptions() Options {
 	}
 }
 
+// validateOptions 检查配置是否满足当前实现的基本约束。
 func validateOptions(opt Options) error {
 	if opt.numLevels < 2 {
 		return fmt.Errorf("db: numLevels must be >= 2")

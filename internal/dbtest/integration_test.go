@@ -11,6 +11,7 @@ import (
 
 // integration_test.go 验证公开 API 的黑盒集成行为。
 
+// TestDBPutGet 验证基础的单键写入与读取。
 func TestDBPutGet(t *testing.T) {
 	dir := t.TempDir()
 	dbDir := filepath.Join(dir, "data")
@@ -37,6 +38,7 @@ func TestDBPutGet(t *testing.T) {
 	}
 }
 
+// TestDBPutFlushReopen 验证显式 flush 后重启仍能读到数据。
 func TestDBPutFlushReopen(t *testing.T) {
 	dir := t.TempDir()
 	dbDir := filepath.Join(dir, "data")
@@ -75,6 +77,7 @@ func TestDBPutFlushReopen(t *testing.T) {
 }
 
 // 关键语义：删除写成 tombstone 后不能被旧 SST 覆盖
+// TestDBDeleteTombstone 验证 tombstone 落盘后不会被旧 SST 覆盖。
 func TestDBDeleteTombstone(t *testing.T) {
 	dir := t.TempDir()
 	dbDir := filepath.Join(dir, "data")
@@ -119,6 +122,7 @@ func TestDBDeleteTombstone(t *testing.T) {
 	}
 }
 
+// TestDBDeleteOverridesSST 验证 mem 中的 tombstone 会遮蔽旧 SST 值。
 func TestDBDeleteOverridesSST(t *testing.T) {
 	dir := t.TempDir()
 	dbDir := filepath.Join(dir, "data")
@@ -151,6 +155,7 @@ func TestDBDeleteOverridesSST(t *testing.T) {
 	}
 }
 
+// TestDBConcurrentPuts 验证并发 Put 之后所有键值都能正确读回。
 func TestDBConcurrentPuts(t *testing.T) {
 	dir := t.TempDir()
 	dbDir := filepath.Join(dir, "data")
@@ -195,6 +200,7 @@ func TestDBConcurrentPuts(t *testing.T) {
 	}
 }
 
+// TestDBWriteBatch_AppliesAllOperations 验证批量写会原子应用所有操作。
 func TestDBWriteBatch_AppliesAllOperations(t *testing.T) {
 	dir := t.TempDir()
 	dbDir := filepath.Join(dir, "data")
@@ -243,6 +249,7 @@ func TestDBWriteBatch_AppliesAllOperations(t *testing.T) {
 	}
 }
 
+// TestDBWriteBatch_FlushAndReopen 验证批量写在 flush 和重启后依然正确。
 func TestDBWriteBatch_FlushAndReopen(t *testing.T) {
 	dir := t.TempDir()
 	dbDir := filepath.Join(dir, "data")
@@ -290,10 +297,12 @@ func TestDBWriteBatch_FlushAndReopen(t *testing.T) {
 	}
 }
 
+// makeTestKey 生成并发测试使用的稳定键。
 func makeTestKey(i int) string {
 	return string([]byte{byte('a' + i%26), byte('0' + (i/26)%10), byte('0' + (i/260)%10)})
 }
 
+// makeTestValue 生成并发测试使用的稳定值。
 func makeTestValue(i int) []byte {
 	return []byte{byte('v'), byte('0' + i%10), byte('0' + (i/10)%10)}
 }

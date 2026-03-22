@@ -119,13 +119,15 @@ func (d *DB) submitWriteBatch(ops []batchOp) error {
 		done: make(chan error, 1),
 	}
 
-	d.writeMu.RLock()
-	if d.writeClosed {
-		d.writeMu.RUnlock()
+	// 写入入口和 Close 会竞争写通道，因此这里先检查关闭状态，
+	// 再把请求投递给后台 writeLoop。
+	d.write.mu.RLock()
+	if d.write.closed {
+		d.write.mu.RUnlock()
 		return errDBClosed
 	}
-	d.writeCh <- req
-	d.writeMu.RUnlock()
+	d.write.ch <- req
+	d.write.mu.RUnlock()
 
 	return <-req.done
 }
@@ -135,7 +137,7 @@ func (d *DB) writeLoop() {
 	defer d.wg.Done()
 
 	for {
-		first, ok := <-d.writeCh
+		first, ok := <-d.write.ch
 		if !ok {
 			return
 		}
@@ -148,7 +150,7 @@ func (d *DB) writeLoop() {
 	collect:
 		for len(batch) < writeBatchMaxCount {
 			select {
-			case req, ok := <-d.writeCh:
+			case req, ok := <-d.write.ch:
 				if !ok {
 					closed = true
 					break collect
@@ -201,13 +203,14 @@ func (d *DB) applyWriteBatch(batch []*writeReq) {
 		}
 
 		// 先批量写 WAL，再按策略 fsync，最后按原顺序应用到 MemTable。
+		// 保持 WAL-before-mem 语义，避免 mem 已可见但 WAL 尚未持久化。
 		if err = d.wal.AppendBatch(records); err == nil {
-			d.writeSeq++
+			d.write.seq++
 
 			if d.opt.walSync == WALSyncEveryBatch {
-				err = d.syncWAL()
+				err = d.write.syncWAL()
 				if err == nil {
-					d.syncedSeq = d.writeSeq
+					d.write.syncedSeq = d.write.seq
 				}
 			}
 		}
@@ -251,7 +254,7 @@ func (d *DB) walSyncLoop() {
 			if err := d.syncPendingWAL(); err != nil {
 				return
 			}
-		case <-d.syncStop:
+		case <-d.write.syncStop:
 			return
 		}
 	}
@@ -265,15 +268,16 @@ func (d *DB) syncPendingWAL() error {
 		d.mu.Unlock()
 		return err
 	}
-	if d.writeSeq == d.syncedSeq {
+	if d.write.seq == d.write.syncedSeq {
 		d.mu.Unlock()
 		return nil
 	}
 
-	targetSeq := d.writeSeq
+	// 先截取当前待同步边界，再锁外执行 fsync，避免长时间阻塞前台路径。
+	targetSeq := d.write.seq
 	d.mu.Unlock()
 
-	if err := d.syncWAL(); err != nil {
+	if err := d.write.syncWAL(); err != nil {
 		d.mu.Lock()
 		if d.bgErr == nil {
 			d.bgErr = err
@@ -283,8 +287,8 @@ func (d *DB) syncPendingWAL() error {
 	}
 
 	d.mu.Lock()
-	if d.syncedSeq < targetSeq {
-		d.syncedSeq = targetSeq
+	if d.write.syncedSeq < targetSeq {
+		d.write.syncedSeq = targetSeq
 	}
 	d.mu.Unlock()
 	return nil

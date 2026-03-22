@@ -9,6 +9,7 @@ import (
 
 // db_flush_auto_test.go 验证自动 flush 的触发条件和后台行为。
 
+// TestDBAutoFlush_TriggersWithoutExplicitFlush 验证达到阈值后会自动触发 flush。
 func TestDBAutoFlush_TriggersWithoutExplicitFlush(t *testing.T) {
 	dir := t.TempDir()
 
@@ -47,6 +48,7 @@ func TestDBAutoFlush_TriggersWithoutExplicitFlush(t *testing.T) {
 	}
 }
 
+// TestDBAutoFlush_ForegroundWritesRemainVisible 验证自动 flush 期间前台写入仍然可见。
 func TestDBAutoFlush_ForegroundWritesRemainVisible(t *testing.T) {
 	dir := t.TempDir()
 

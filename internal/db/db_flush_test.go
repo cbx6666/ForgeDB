@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // db_flush_test.go 验证显式 flush 的状态转换、落盘安装和恢复语义。
@@ -11,7 +12,7 @@ import (
 // ======== 测试辅助 ========
 
 // 在持锁状态下读取内部状态，避免与并发测试路径产生竞态。
-type flushState struct {
+type flushSnapshot struct {
 	immNil  bool
 	memNil  bool
 	l0Count int
@@ -19,13 +20,14 @@ type flushState struct {
 	wal     string
 }
 
-func snapshotFlushStateLocked(d *DB) flushState {
+// snapshotFlushStateLocked 抓取 flush 相关的内部状态快照。
+func snapshotFlushStateLocked(d *DB) flushSnapshot {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	levels := d.currentVersion().levels
 
-	s := flushState{
+	s := flushSnapshot{
 		immNil: d.imm == nil,
 		memNil: d.mem == nil,
 		wal:    d.walPath,
@@ -37,6 +39,7 @@ func snapshotFlushStateLocked(d *DB) flushState {
 	return s
 }
 
+// fileExists 判断指定路径当前是否存在。
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
@@ -45,6 +48,7 @@ func fileExists(path string) bool {
 // ======== tests ========
 
 // 1) white-box: prepareFlushLocked 必须完成 mem -> imm 冻结与 WAL 轮换
+// TestDB_FlushPrepare_RotatesMemAndWAL 验证 prepare 会冻结 mem 并轮换 WAL。
 func TestDB_FlushPrepare_RotatesMemAndWAL(t *testing.T) {
 	dir := t.TempDir()
 
@@ -124,7 +128,7 @@ func TestDB_FlushPrepare_RotatesMemAndWAL(t *testing.T) {
 		t.Fatal(err)
 	}
 	d.mu.Lock()
-	err = d.installFlushLocked(job)
+	err = d.installFlushLocked()
 	d.mu.Unlock()
 	if err != nil {
 		t.Fatal(err)
@@ -132,6 +136,7 @@ func TestDB_FlushPrepare_RotatesMemAndWAL(t *testing.T) {
 }
 
 // 2) white-box + black-box: flush 期间前台继续写，新旧都能读；install 后 imm 清空、L0 增加、flush wal 删除
+// TestDB_Flush_ForegroundWritesDuringFlushAndInstallCleansUp 验证 flush 期间前台写入与安装清理语义。
 func TestDB_Flush_ForegroundWritesDuringFlushAndInstallCleansUp(t *testing.T) {
 	dir := t.TempDir()
 
@@ -194,7 +199,7 @@ func TestDB_Flush_ForegroundWritesDuringFlushAndInstallCleansUp(t *testing.T) {
 	if len(levelsBefore) > 0 {
 		l0Before = len(levelsBefore[0].l0Paths)
 	}
-	err = d.installFlushLocked(job)
+	err = d.installFlushLocked()
 	immNil := (d.imm == nil)
 	levelsAfter := d.currentVersion().levels
 	l0After := 0
@@ -236,6 +241,7 @@ func TestDB_Flush_ForegroundWritesDuringFlushAndInstallCleansUp(t *testing.T) {
 }
 
 // 3) white-box crash simulation: prepare 后不 do/install，重启必须从 forge.flush.wal + forge.wal 恢复
+// TestDB_Reopen_RecoversFlushWALAndActiveWAL 验证中间态下重启能从两份 WAL 恢复。
 func TestDB_Reopen_RecoversFlushWALAndActiveWAL(t *testing.T) {
 	dir := t.TempDir()
 
@@ -328,6 +334,7 @@ func TestDB_Reopen_RecoversFlushWALAndActiveWAL(t *testing.T) {
 }
 
 // 3.1) white-box crash simulation: SST 已经写出，但 install 前崩溃；重启后仍应以两份 WAL 为准恢复。
+// TestDB_Reopen_RecoversWhenFlushSSTExistsButInstallNotDone 验证未安装 SST 的重启恢复语义。
 func TestDB_Reopen_RecoversWhenFlushSSTExistsButInstallNotDone(t *testing.T) {
 	dir := t.TempDir()
 
@@ -399,6 +406,7 @@ func TestDB_Reopen_RecoversWhenFlushSSTExistsButInstallNotDone(t *testing.T) {
 }
 
 // 4) sanity: 多次 Flush 后 imm 不残留、L0 递增、读语义正确
+// TestDB_MultipleFlushes_NoImmLeakAndReadsCorrect 验证多次 flush 后不会残留 imm 且读取正确。
 func TestDB_MultipleFlushes_NoImmLeakAndReadsCorrect(t *testing.T) {
 	dir := t.TempDir()
 
@@ -446,6 +454,7 @@ func TestDB_MultipleFlushes_NoImmLeakAndReadsCorrect(t *testing.T) {
 }
 
 // 5) extra white-box: installFlushLocked 前后文件路径应符合约定（tmp 不残留，final 在 L0）
+// TestDB_Flush_FileLayout_NoTmpLeft 验证 flush 后不会残留临时文件。
 func TestDB_Flush_FileLayout_NoTmpLeft(t *testing.T) {
 	dir := t.TempDir()
 
@@ -486,7 +495,7 @@ func TestDB_Flush_FileLayout_NoTmpLeft(t *testing.T) {
 
 	// install
 	d.mu.Lock()
-	err = d.installFlushLocked(job)
+	err = d.installFlushLocked()
 	d.mu.Unlock()
 	if err != nil {
 		t.Fatal(err)
@@ -509,5 +518,61 @@ func TestDB_Flush_FileLayout_NoTmpLeft(t *testing.T) {
 	wantPrefix := filepath.Join(d.sstDir, "l0") + string(os.PathSeparator)
 	if len(job.path) < len(wantPrefix) || job.path[:len(wantPrefix)] != wantPrefix {
 		t.Fatalf("expected sst under l0 dir, got %s want prefix %s", job.path, wantPrefix)
+	}
+}
+
+// 6) white-box: 如果已经完成 prepare，显式 Flush 仍应唤醒后台 flushLoop 并等待该轮完成。
+// TestDB_Flush_AdoptsPreparedJob 验证公开 Flush 会接管已 prepare 的 job。
+func TestDB_Flush_AdoptsPreparedJob(t *testing.T) {
+	dir := t.TempDir()
+
+	d, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+
+	if err := d.Put("prepared", []byte("v-prepared")); err != nil {
+		t.Fatal(err)
+	}
+
+	d.mu.Lock()
+	job, err := d.prepareFlushLocked()
+	d.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job == nil {
+		t.Fatal("prepareFlushLocked returned nil job")
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- d.Flush()
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Flush did not finish prepared job in time")
+	}
+
+	got, ok, err := d.Get("prepared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || string(got) != "v-prepared" {
+		t.Fatalf("want prepared=v-prepared after Flush, ok=%v got=%q", ok, string(got))
+	}
+
+	s := snapshotFlushStateLocked(d)
+	if !s.immNil {
+		t.Fatal("expected imm cleared after prepared flush")
+	}
+	if s.l0Count != 1 {
+		t.Fatalf("expected one L0 table after prepared flush, got %d", s.l0Count)
 	}
 }

@@ -9,6 +9,7 @@ import (
 
 // db_read_test.go 验证点查、范围读和多层来源合并语义。
 
+// TestDBScan_MergesMemImmAndSST 验证 Scan 会按可见性顺序合并 mem、imm 和 SST。
 func TestDBScan_MergesMemImmAndSST(t *testing.T) {
 	dir := t.TempDir()
 
@@ -58,6 +59,7 @@ func TestDBScan_MergesMemImmAndSST(t *testing.T) {
 	}
 }
 
+// TestDBIterator_RespectsRangeBounds 验证迭代器会遵守给定的范围边界。
 func TestDBIterator_RespectsRangeBounds(t *testing.T) {
 	dir := t.TempDir()
 
@@ -103,6 +105,7 @@ func TestDBIterator_RespectsRangeBounds(t *testing.T) {
 	}
 }
 
+// TestDBScan_AfterCompactionIntoL1 验证 compaction 后的范围读结果仍然正确。
 func TestDBScan_AfterCompactionIntoL1(t *testing.T) {
 	dir := t.TempDir()
 

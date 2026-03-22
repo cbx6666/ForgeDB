@@ -138,35 +138,43 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 		opt:        opt,
 		nextID:     nextID,
 		cache:      sstable.NewTableCache(),
-		pending:    make(map[string]struct{}),
-		writeCh:    make(chan *writeReq, 256),
-		syncWAL:    w.Sync,
+		write: writeState{
+			ch:      make(chan *writeReq, 256),
+			syncWAL: w.Sync,
+		},
+		compaction: compactionState{
+			pendingPaths: make(map[string]struct{}),
+		},
 	}
 
 	if opt.walSync == WALSyncInterval {
-		db.syncStop = make(chan struct{})
+		db.write.syncStop = make(chan struct{})
 	}
 
 	if opt.autoFlushBytes > 0 {
-		db.autoFlushCh = make(chan struct{}, 1)
-		db.autoFlushStop = make(chan struct{})
+		db.flush.autoCh = make(chan struct{}, 1)
+		db.flush.autoStop = make(chan struct{})
 	}
 
-	db.cond = sync.NewCond(&db.mu)
+	db.compaction.cond = sync.NewCond(&db.mu)
+	db.flush.cond = sync.NewCond(&db.mu)
 
 	// 启动后台协程。
+	db.wg.Add(1)
+	go db.flushLoop()
+
 	db.wg.Add(1)
 	go db.compactionLoop()
 
 	db.wg.Add(1)
 	go db.writeLoop()
 
-	if db.syncStop != nil {
+	if db.write.syncStop != nil {
 		db.wg.Add(1)
 		go db.walSyncLoop()
 	}
 
-	if db.autoFlushCh != nil {
+	if db.flush.autoCh != nil {
 		db.wg.Add(1)
 		go db.autoFlushLoop()
 		// 启动后如果内存表已超阈值，立刻触发一次检查。
@@ -180,24 +188,28 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 func (d *DB) Close() error {
 	d.mu.Lock()
 	d.closing = true
-	if d.cond != nil {
+	if d.compaction.cond != nil {
 		// 唤醒所有等待中的后台协程。
-		d.cond.Broadcast()
+		d.compaction.cond.Broadcast()
+	}
+	if d.flush.cond != nil {
+		// 唤醒所有等待中的 flush 协程和调用方。
+		d.flush.cond.Broadcast()
 	}
 	d.mu.Unlock()
 
-	d.writeMu.Lock()
-	if !d.writeClosed {
-		d.writeClosed = true
-		close(d.writeCh)
+	d.write.mu.Lock()
+	if !d.write.closed {
+		d.write.closed = true
+		close(d.write.ch)
 	}
-	d.writeMu.Unlock()
+	d.write.mu.Unlock()
 
-	if d.syncStop != nil {
-		close(d.syncStop)
+	if d.write.syncStop != nil {
+		close(d.write.syncStop)
 	}
-	if d.autoFlushStop != nil {
-		close(d.autoFlushStop)
+	if d.flush.autoStop != nil {
+		close(d.flush.autoStop)
 	}
 
 	// 等待后台协程退出后再关闭文件资源。

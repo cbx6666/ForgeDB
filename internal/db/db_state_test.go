@@ -4,6 +4,7 @@ import "testing"
 
 // db_state_test.go 验证版本视图和状态复制的只读语义。
 
+// TestNewVersionFromLevels_ClonesInput 验证构建新版本时会深拷贝输入层级。
 func TestNewVersionFromLevels_ClonesInput(t *testing.T) {
 	src := []level{
 		{
@@ -55,6 +56,7 @@ func TestNewVersionFromLevels_ClonesInput(t *testing.T) {
 	}
 }
 
+// TestVersion_WithLevels_DoesNotMutateOldVersion 验证复制得到的新版本不会污染旧版本。
 func TestVersion_WithLevels_DoesNotMutateOldVersion(t *testing.T) {
 	oldv := newVersionFromLevels([]level{
 		{
@@ -107,6 +109,7 @@ func TestVersion_WithLevels_DoesNotMutateOldVersion(t *testing.T) {
 	}
 }
 
+// TestVersion_WithLevels_NilReceiver 验证 nil 接收者也能返回空版本副本。
 func TestVersion_WithLevels_NilReceiver(t *testing.T) {
 	var v *Version
 	got := v.withLevels()

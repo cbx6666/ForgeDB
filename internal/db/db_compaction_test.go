@@ -11,6 +11,7 @@ import (
 // ======== 测试辅助 ========
 
 // 断言：runs 按 minKey 升序，且不重叠（prev.maxKey < next.minKey）
+// assertRunsSortedNoOverlap 断言 runs 按 key 有序且互不重叠。
 func assertRunsSortedNoOverlap(t *testing.T, runs []levelFile) {
 	t.Helper()
 	for i := 1; i < len(runs); i++ {
@@ -25,6 +26,7 @@ func assertRunsSortedNoOverlap(t *testing.T, runs []levelFile) {
 }
 
 // 异步后台：等待条件在 deadline 前成立，否则失败（用于“最终一致性”结构验证）
+// waitUntil 在给定期限内等待条件成立。
 func waitUntil(t *testing.T, deadline time.Duration, tick time.Duration, cond func() bool, onTimeoutMsg func() string) {
 	t.Helper()
 	start := time.Now()
@@ -43,8 +45,13 @@ func waitUntil(t *testing.T, deadline time.Duration, tick time.Duration, cond fu
 }
 
 // 方便构造可预测 key/value
+// k 生成规则化的测试键。
 func k(i int) string { return fmt.Sprintf("k%06d", i) }
+
+// v 生成规则化的测试值。
 func v(i int) []byte { return []byte(fmt.Sprintf("v%06d", i)) }
+
+// keyA 生成用于构造有序范围的测试键。
 func keyA(i int) string {
 	return fmt.Sprintf("A%d", i)
 }
@@ -56,6 +63,7 @@ type levelSnapshot struct {
 	l2 int
 }
 
+// snapshotLevels 抓取各层当前文件数量快照。
 func snapshotLevels(d *DB) levelSnapshot {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -75,6 +83,7 @@ func snapshotLevels(d *DB) levelSnapshot {
 	return s
 }
 
+// assertInvariantsLocked 检查当前层级结构的不变量。
 func assertInvariantsLocked(t *testing.T, d *DB) {
 	t.Helper()
 	d.mu.Lock()
@@ -90,6 +99,7 @@ func assertInvariantsLocked(t *testing.T, d *DB) {
 	}
 }
 
+// TestDB_PickCompactionLevel_PrefersMostOverloadedLevel 验证调度会优先选择最超载的层。
 func TestDB_PickCompactionLevel_PrefersMostOverloadedLevel(t *testing.T) {
 	dir := t.TempDir()
 
@@ -131,6 +141,7 @@ func TestDB_PickCompactionLevel_PrefersMostOverloadedLevel(t *testing.T) {
 	}
 }
 
+// mustBuildManualL0Compaction 手工构造一轮 L0 compaction 及其结果。
 func mustBuildManualL0Compaction(t *testing.T, d *DB) (*compactionJob, *compactionResult) {
 	t.Helper()
 
@@ -159,6 +170,7 @@ func mustBuildManualL0Compaction(t *testing.T, d *DB) (*compactionJob, *compacti
 	return job, res
 }
 
+// installCompactionVersionWithoutCleanup 安装 compaction 版本但暂不清理旧文件。
 func installCompactionVersionWithoutCleanup(t *testing.T, d *DB, res *compactionResult) []string {
 	t.Helper()
 
@@ -219,6 +231,7 @@ func installCompactionVersionWithoutCleanup(t *testing.T, d *DB, res *compaction
 // ========== tests ==========
 
 // 1) 基础正确性：tombstone 不复活 + reopen 后仍正确（不依赖 compaction 立刻完成）
+// TestDB_TombstoneAndReopen_Correctness 验证 tombstone 经 compaction 和重启后仍保持正确。
 func TestDB_TombstoneAndReopen_Correctness(t *testing.T) {
 	dir := t.TempDir()
 
@@ -306,6 +319,7 @@ func TestDB_TombstoneAndReopen_Correctness(t *testing.T) {
 }
 
 // 2) newest-value：多版本落盘后，必须读到最新（与 compaction 是否完成无关）
+// TestDB_KeepsNewestValue 验证 compaction 会保留同 key 的最新值。
 func TestDB_KeepsNewestValue(t *testing.T) {
 	dir := t.TempDir()
 
@@ -332,6 +346,7 @@ func TestDB_KeepsNewestValue(t *testing.T) {
 	assertInvariantsLocked(t, d)
 }
 
+// TestDB_Compaction_KeepsNewestValueAcrossL0 验证跨多个 L0 文件 compaction 时仍保留最新值。
 func TestDB_Compaction_KeepsNewestValueAcrossL0(t *testing.T) {
 	dir := t.TempDir()
 
@@ -391,6 +406,7 @@ func TestDB_Compaction_KeepsNewestValueAcrossL0(t *testing.T) {
 	}
 }
 
+// TestDB_Compaction_DropsBottomLevelTombstones 验证最后一层 compaction 会丢弃墓碑。
 func TestDB_Compaction_DropsBottomLevelTombstones(t *testing.T) {
 	dir := t.TempDir()
 
@@ -454,6 +470,7 @@ func TestDB_Compaction_DropsBottomLevelTombstones(t *testing.T) {
 }
 
 // 3) 针对后台 compaction：触发阈值后，最终应完成 L0->L1，并满足 L1 不变式
+// TestDB_BackgroundCompaction_EventuallyL0ToL1 验证后台 compaction 最终会把数据从 L0 推进到 L1。
 func TestDB_BackgroundCompaction_EventuallyL0ToL1(t *testing.T) {
 	dir := t.TempDir()
 
@@ -514,6 +531,7 @@ func TestDB_BackgroundCompaction_EventuallyL0ToL1(t *testing.T) {
 }
 
 // 4) 多层后台 compaction：最终应能把数据推进到 L2（L0->L1->L2）
+// TestDB_BackgroundCompaction_EventuallyThreeLevelsToL2 验证后台 compaction 最终会把数据推进到更深层级。
 func TestDB_BackgroundCompaction_EventuallyThreeLevelsToL2(t *testing.T) {
 	dir := t.TempDir()
 
@@ -601,6 +619,7 @@ func TestDB_BackgroundCompaction_EventuallyThreeLevelsToL2(t *testing.T) {
 }
 
 // 5) 后台 compaction 在运行期间，前台写入/读取仍保持正确性（这里只测“正确性”，不测性能）
+// TestDB_BackgroundCompaction_ForegroundOpsRemainCorrect 验证后台 compaction 期间前台操作仍然正确。
 func TestDB_BackgroundCompaction_ForegroundOpsRemainCorrect(t *testing.T) {
 	dir := t.TempDir()
 
@@ -660,6 +679,7 @@ func TestDB_BackgroundCompaction_ForegroundOpsRemainCorrect(t *testing.T) {
 
 // 6) white-box crash simulation: doCompaction 已写出新 SST，但 install 前崩溃；
 // 重启后应保留 manifest 里仍引用的旧文件，并清理新的 orphan compaction outputs。
+// TestDB_Reopen_RemovesOrphanCompactionOutputsBeforeInstall 验证重启会清理未安装的 compaction 输出。
 func TestDB_Reopen_RemovesOrphanCompactionOutputsBeforeInstall(t *testing.T) {
 	dir := t.TempDir()
 
@@ -731,6 +751,7 @@ func TestDB_Reopen_RemovesOrphanCompactionOutputsBeforeInstall(t *testing.T) {
 
 // 7) white-box crash simulation: manifest 已安装新 compaction 结果，但旧文件尚未删除就崩溃；
 // 重启后应保留新文件，并清理已不再被 manifest 引用的旧输入文件。
+// TestDB_Reopen_CleansOldCompactionInputsAfterManifestInstalled 验证 manifest 已安装后重启会清理旧 compaction 输入。
 func TestDB_Reopen_CleansOldCompactionInputsAfterManifestInstalled(t *testing.T) {
 	dir := t.TempDir()
 

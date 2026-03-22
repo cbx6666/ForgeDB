@@ -19,8 +19,10 @@ type heapItem struct {
 
 type mergeHeap []heapItem
 
+// Len 返回堆中当前元素数量。
 func (h mergeHeap) Len() int { return len(h) }
 
+// Less 定义最小堆顺序：先按 key，再按输入优先级。
 func (h mergeHeap) Less(i, j int) bool {
 	ki, kj := h[i].ent.Key, h[j].ent.Key
 	if ki != kj {
@@ -29,10 +31,13 @@ func (h mergeHeap) Less(i, j int) bool {
 	return h[i].priority < h[j].priority
 }
 
+// Swap 交换堆中两个元素的位置。
 func (h mergeHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 
+// Push 向堆中压入一个新的候选项。
 func (h *mergeHeap) Push(x any) { *h = append(*h, x.(heapItem)) }
 
+// Pop 从堆中弹出当前最小的候选项。
 func (h *mergeHeap) Pop() any {
 	old := *h
 	n := len(old)
@@ -42,17 +47,22 @@ func (h *mergeHeap) Pop() any {
 }
 
 type compactionJob struct {
+	// level 表示源层编号，目标层固定为 level+1。
 	level int
 
+	// srcPaths 是源层被选中的输入文件，dstPaths 是目标层和其范围重叠的旧文件。
 	srcPaths []string
 	dstPaths []string
 
+	// minKey/maxKey 表示这轮 compaction 覆盖的整体 key 范围。
 	minKey string
 	maxKey string
 }
 
 type compactionResult struct {
-	job     *compactionJob
+	// job 保留原始任务元数据，便于安装阶段回收旧文件和清理 pending。
+	job *compactionJob
+	// newRuns 是这轮 compaction 产出的目标层新文件集合。
 	newRuns []levelFile
 }
 
@@ -74,16 +84,15 @@ func (d *DB) compactionLoop() {
 	for {
 		// 1) 等待请求或关闭信号。
 		d.mu.Lock()
-		for !d.closing && !d.compactionReq {
-			d.cond.Wait()
+		for !d.closing && !d.compaction.compactionReq {
+			d.compaction.cond.Wait()
 		}
 		if d.closing {
 			d.mu.Unlock()
 			return
 		}
 
-		d.compactionReq = false
-		d.compacting = true
+		d.compaction.compactionReq = false
 		d.mu.Unlock()
 
 		// 2) 持续压实，直到没有任何层超阈值。
@@ -91,20 +100,18 @@ func (d *DB) compactionLoop() {
 			d.mu.Lock()
 
 			if d.closing {
-				d.compacting = false
 				d.mu.Unlock()
 				return
 			}
 
 			if d.bgErr != nil {
-				d.compacting = false
 				d.mu.Unlock()
 				break
 			}
 
 			level, ok := d.pickCompactionLevelLocked()
 			if !ok {
-				d.compacting = false
+				// 当前已经没有层超阈值，这一轮后台 compaction 可以先收住。
 				d.mu.Unlock()
 				break
 			}
@@ -114,13 +121,13 @@ func (d *DB) compactionLoop() {
 			if err != nil {
 				d.mu.Lock()
 				d.bgErr = err
-				d.compacting = false
+				// 一旦选任务出错，后续操作统一通过 bgErr 快速失败。
 				d.mu.Unlock()
 				break
 			}
 			if job == nil {
 				d.mu.Lock()
-				d.compacting = false
+				// 没有可执行 job 通常意味着都被 pending 占住了，先退出本轮等待下一次请求。
 				d.mu.Unlock()
 				break
 			}
@@ -129,8 +136,8 @@ func (d *DB) compactionLoop() {
 			if err != nil {
 				d.mu.Lock()
 				d.clearJobPendingLocked(job)
+				// 执行阶段失败时必须清掉 pending，避免后续该范围永久不可选。
 				d.bgErr = err
-				d.compacting = false
 				d.mu.Unlock()
 				break
 			}
@@ -138,8 +145,8 @@ func (d *DB) compactionLoop() {
 			d.mu.Lock()
 			if err := d.installCompactionLocked(res); err != nil {
 				d.clearJobPendingLocked(job)
+				// 安装失败同样要先回收 pending，再把错误上升到全局后台错误。
 				d.bgErr = err
-				d.compacting = false
 				d.mu.Unlock()
 				break
 			}
@@ -150,8 +157,9 @@ func (d *DB) compactionLoop() {
 
 // requestCompactionLocked 在锁内标记并唤醒后台 compaction。
 func (d *DB) requestCompactionLocked() {
-	d.compactionReq = true
-	d.cond.Signal()
+	d.compaction.compactionReq = true
+	// compactionLoop 只有一个消费者，这里 signal 一个等待者即可。
+	d.compaction.cond.Signal()
 }
 
 // checkBGErrLocked 返回后台协程记录的首个错误。
@@ -174,6 +182,7 @@ func (d *DB) pickCompactionLevelLocked() (int, bool) {
 	}
 
 	betterThan := func(a, b levelScore) bool {
+		// 先比较超阈值比例，再比较超额文件数，最后用层号做稳定 tie-break。
 		left := a.current * b.limit
 		right := b.current * a.limit
 		if left != right {
@@ -204,6 +213,7 @@ func (d *DB) pickCompactionLevelLocked() (int, bool) {
 			continue
 		}
 
+		// debt 表示当前层超出阈值多少个文件，用作同等比例下的次级排序键。
 		debt := current - maxFiles
 
 		cand := levelScore{
@@ -219,6 +229,7 @@ func (d *DB) pickCompactionLevelLocked() (int, bool) {
 	if best.level < 0 {
 		return 0, false
 	}
+	// 返回最需要 compaction 的层，目标层固定为 best.level+1。
 	return best.level, true
 }
 
@@ -247,6 +258,7 @@ func (d *DB) pickCompactionJobLocked(level int) (*compactionJob, error) {
 		return nil, nil
 	}
 
+	// 1) 从源层挑一批输入文件。
 	var pickedPaths []string
 	if level == 0 {
 		picked, _ := pickOldestL0(src.l0Paths, pickN, d.isPendingLocked)
@@ -261,21 +273,25 @@ func (d *DB) pickCompactionJobLocked(level int) (*compactionJob, error) {
 		return nil, nil
 	}
 
+	// 2) 计算源层输入覆盖的整体 key 范围。
 	minK, maxK, err := rangeOfFiles(pickedPaths)
 	if err != nil {
 		return nil, err
 	}
 
+	// 3) 找出目标层里和这段范围有交叠的文件。
 	overIdx := overlappedRuns(dst.runs, minK, maxK)
 	dstPaths := make([]string, 0, len(overIdx))
 	for _, i := range overIdx {
 		p := dst.runs[i].path
 		if d.isPendingLocked(p) {
+			// 目标层有重叠文件已被别的后台任务占用时，这轮任务直接放弃。
 			return nil, nil
 		}
 		dstPaths = append(dstPaths, p)
 	}
 
+	// 4) 标记 pending，避免后台重复选中同一批文件。
 	all := make([]string, 0, len(pickedPaths)+len(dstPaths))
 	all = append(all, pickedPaths...)
 	all = append(all, dstPaths...)
@@ -296,6 +312,8 @@ func (d *DB) doCompaction(job *compactionJob) (*compactionResult, error) {
 	inputs = append(inputs, job.srcPaths...)
 	inputs = append(inputs, job.dstPaths...)
 
+	// 目标层已经是最后一层时，后面不再有更老数据需要被 tombstone 遮蔽，
+	// 因此可以直接在这轮 compaction 中丢弃删除标记。
 	dropBottomTombstones := job.level+1 == d.opt.numLevels-1
 	newRuns, _, err := d.streamCompactionRuns(job.level+1, inputs, dropBottomTombstones)
 	if err != nil {
@@ -322,12 +340,15 @@ func (d *DB) streamCompactionRuns(dstLevel int, inputs []string, dropBottomTombs
 	}()
 
 	for prio, path := range inputs {
+		// 为每个输入 SST 打开顺序迭代器，并记录输入优先级。
+		// priority 越小，表示这一路输入越“新”，同 key 去重时应优先保留。
 		it, err := sstable.NewIter(path)
 		if err != nil {
 			return nil, nil, err
 		}
 		iters = append(iters, it)
 		if it.Valid() {
+			// 只把当前有效项放进堆，后续靠迭代器推进维持多路归并。
 			heap.Push(h, heapItem{it: it, ent: it.Entry(), priority: prio})
 		}
 	}
@@ -337,6 +358,7 @@ func (d *DB) streamCompactionRuns(dstLevel int, inputs []string, dropBottomTombs
 	chunk := make([]types.Entry, 0, runMax)
 
 	cleanupCreated := func() {
+		// 一旦中途失败，删除已经写出的 compaction 产物，避免留下孤儿文件。
 		for _, p := range created {
 			_ = removeFileAndSync(p)
 		}
@@ -346,6 +368,7 @@ func (d *DB) streamCompactionRuns(dstLevel int, inputs []string, dropBottomTombs
 		if len(chunk) == 0 {
 			return nil
 		}
+		// chunk 的大小已经被 runMax 限住了，因此这里一次只写一个目标 run。
 		run, made, err := d.writeSingleRun(dstLevel, chunk)
 		if err != nil {
 			cleanupCreated()
@@ -358,11 +381,13 @@ func (d *DB) streamCompactionRuns(dstLevel int, inputs []string, dropBottomTombs
 	}
 
 	emit := func(ent types.Entry) error {
+		// 到达最后一层时，墓碑不需要继续向后传播，可以直接丢弃。
 		if dropBottomTombstones && ent.Tombstone {
 			return nil
 		}
 		chunk = append(chunk, ent)
 		if len(chunk) < runMax {
+			// 还没达到目标 run 大小上限时继续聚合。
 			return nil
 		}
 		return flushChunk()
@@ -372,9 +397,12 @@ func (d *DB) streamCompactionRuns(dstLevel int, inputs []string, dropBottomTombs
 	hasLast := false
 
 	for h.Len() > 0 {
+		// 每次取出当前全局最小 key；如果 key 相同，则由 priority 保证
+		// “较新的输入先出堆”，从而完成跨文件去重。
 		item := heap.Pop(h).(heapItem)
 
 		if !hasLast || item.ent.Key != lastKey {
+			// 只有遇到一个新 key 时才真正输出一次。
 			if err := emit(item.ent); err != nil {
 				return nil, nil, err
 			}
@@ -382,6 +410,7 @@ func (d *DB) streamCompactionRuns(dstLevel int, inputs []string, dropBottomTombs
 			hasLast = true
 		}
 
+		// 推进当前输入迭代器，并把下一个候选项重新放回堆中。
 		if err := item.it.Next(); err != nil {
 			cleanupCreated()
 			return nil, nil, err
@@ -392,6 +421,7 @@ func (d *DB) streamCompactionRuns(dstLevel int, inputs []string, dropBottomTombs
 		}
 	}
 
+	// 刷出最后一个未满的分段。
 	if err := flushChunk(); err != nil {
 		return nil, nil, err
 	}
@@ -405,6 +435,7 @@ func (d *DB) installCompactionLocked(res *compactionResult) error {
 
 	oldv := d.currentVersion()
 	if level < 0 || level+1 >= len(oldv.levels) {
+		// 越界结果直接忽略，避免在安装阶段把结构写坏。
 		return nil
 	}
 
@@ -413,24 +444,29 @@ func (d *DB) installCompactionLocked(res *compactionResult) error {
 	src := &newv.levels[level]
 	dst := &newv.levels[level+1]
 
+	// 1) 从源层移除当前 job 的输入文件。
 	if level == 0 {
 		src.l0Paths = removePaths(src.l0Paths, job.srcPaths)
 	} else {
 		src.runs = removeRunsByPaths(src.runs, job.srcPaths)
 	}
 
+	// 2) 重新计算目标层里真实重叠的旧文件区间。
 	overIdx := overlappedRuns(dst.runs, job.minKey, job.maxKey)
 	realOldDst := make([]string, 0, len(overIdx))
 	for _, i := range overIdx {
 		realOldDst = append(realOldDst, dst.runs[i].path)
 	}
 
+	// 3) 用新的 runs 替换目标层重叠区间。
 	newDst := make([]levelFile, 0, len(dst.runs)-len(overIdx)+len(res.newRuns))
 	if len(overIdx) == 0 {
+		// 没有重叠时直接追加新 runs，再按 minKey 排序即可。
 		newDst = append(newDst, dst.runs...)
 		newDst = append(newDst, res.newRuns...)
 		sort.Slice(newDst, func(i, j int) bool { return newDst[i].minKey < newDst[j].minKey })
 	} else {
+		// 有重叠时只替换那一段区间，其余 runs 保持原顺序。
 		start := overIdx[0]
 		end := overIdx[len(overIdx)-1] + 1
 		newDst = append(newDst, dst.runs[:start]...)
@@ -439,14 +475,17 @@ func (d *DB) installCompactionLocked(res *compactionResult) error {
 	}
 	dst.runs = newDst
 
+	// 4) manifest 持久化成功后，新版本视图才正式生效。
 	if err := d.persistManifestLevels(newv.levels); err != nil {
 		return err
 	}
 
 	d.current = newv
 
+	// 5) 删除已经被新版本替换掉的旧文件。
 	for _, p := range job.srcPaths {
 		if d.cache != nil {
+			// 删除文件前先驱逐缓存，避免后续命中已经失效的表对象。
 			d.cache.Evict(p)
 		}
 		if err := removeFileAndSync(p); err != nil {
@@ -462,6 +501,7 @@ func (d *DB) installCompactionLocked(res *compactionResult) error {
 		}
 	}
 
+	// 6) 清理 pending 标记，允许后续 compaction 再次选中相关范围。
 	all := make([]string, 0, len(job.srcPaths)+len(realOldDst))
 	all = append(all, job.srcPaths...)
 	all = append(all, realOldDst...)
@@ -472,21 +512,22 @@ func (d *DB) installCompactionLocked(res *compactionResult) error {
 
 // isPendingLocked 判断某个路径是否已经被后台任务占用。
 func (d *DB) isPendingLocked(path string) bool {
-	_, ok := d.pending[path]
+	_, ok := d.compaction.pendingPaths[path]
 	return ok
 }
 
 // markPendingLocked 标记一组路径正在被后台任务使用。
 func (d *DB) markPendingLocked(paths []string) {
 	for _, p := range paths {
-		d.pending[p] = struct{}{}
+		// pending 按文件路径去重，避免后台任务重复消费同一输入。
+		d.compaction.pendingPaths[p] = struct{}{}
 	}
 }
 
 // clearPendingLocked 清理一组路径的 pending 标记。
 func (d *DB) clearPendingLocked(paths []string) {
 	for _, p := range paths {
-		delete(d.pending, p)
+		delete(d.compaction.pendingPaths, p)
 	}
 }
 

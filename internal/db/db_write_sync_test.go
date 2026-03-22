@@ -26,7 +26,7 @@ func TestDBWALSyncNever_DoesNotCallSync(t *testing.T) {
 
 	var mu sync.Mutex
 	syncCalls := 0
-	d.syncWAL = func() error {
+	d.write.syncWAL = func() error {
 		mu.Lock()
 		defer mu.Unlock()
 		syncCalls++
@@ -44,6 +44,7 @@ func TestDBWALSyncNever_DoesNotCallSync(t *testing.T) {
 	}
 }
 
+// TestDBWALSyncEveryBatch_CallsSync 验证 every-batch 模式下每个批次都会触发 fsync。
 // SyncEveryBatch 模式下，每个成功提交的批次都应触发一次 fsync。
 func TestDBWALSyncEveryBatch_CallsSync(t *testing.T) {
 	dir := t.TempDir()
@@ -60,7 +61,7 @@ func TestDBWALSyncEveryBatch_CallsSync(t *testing.T) {
 
 	var mu sync.Mutex
 	syncCalls := 0
-	d.syncWAL = func() error {
+	d.write.syncWAL = func() error {
 		mu.Lock()
 		defer mu.Unlock()
 		syncCalls++
@@ -78,6 +79,7 @@ func TestDBWALSyncEveryBatch_CallsSync(t *testing.T) {
 	}
 }
 
+// TestDBWALSyncInterval_CallsSyncAfterInterval 验证 interval 模式下同步由后台定时触发。
 // SyncInterval 模式下，fsync 应在定时器到点后异步触发，而不是在前台写路径里立刻执行。
 func TestDBWALSyncInterval_CallsSyncAfterInterval(t *testing.T) {
 	dir := t.TempDir()
@@ -95,7 +97,7 @@ func TestDBWALSyncInterval_CallsSyncAfterInterval(t *testing.T) {
 
 	var mu sync.Mutex
 	syncCalls := 0
-	d.syncWAL = func() error {
+	d.write.syncWAL = func() error {
 		mu.Lock()
 		defer mu.Unlock()
 		syncCalls++
@@ -121,6 +123,7 @@ func TestDBWALSyncInterval_CallsSyncAfterInterval(t *testing.T) {
 	}, "expected interval sync to be triggered")
 }
 
+// TestDBWALSyncError_DoesNotApplyMemtable 验证同步失败时这一批写不会进入 memtable。
 // 如果 fsync 失败，这一批写不能进入 memtable，后续读取也应看到后台错误。
 func TestDBWALSyncError_DoesNotApplyMemtable(t *testing.T) {
 	dir := t.TempDir()
@@ -136,7 +139,7 @@ func TestDBWALSyncError_DoesNotApplyMemtable(t *testing.T) {
 	defer func() { _ = d.Close() }()
 
 	wantErr := errors.New("sync failed")
-	d.syncWAL = func() error {
+	d.write.syncWAL = func() error {
 		return wantErr
 	}
 
@@ -150,6 +153,7 @@ func TestDBWALSyncError_DoesNotApplyMemtable(t *testing.T) {
 	}
 }
 
+// TestDBWALSyncInterval_ErrorEventuallySetsBGErr 验证异步同步失败最终会暴露为后台错误。
 // Interval 模式下，fsync 异步失败后应最终暴露为后台错误。
 func TestDBWALSyncInterval_ErrorEventuallySetsBGErr(t *testing.T) {
 	dir := t.TempDir()
@@ -166,7 +170,7 @@ func TestDBWALSyncInterval_ErrorEventuallySetsBGErr(t *testing.T) {
 	defer func() { _ = d.Close() }()
 
 	wantErr := errors.New("interval sync failed")
-	d.syncWAL = func() error {
+	d.write.syncWAL = func() error {
 		return wantErr
 	}
 
@@ -180,6 +184,7 @@ func TestDBWALSyncInterval_ErrorEventuallySetsBGErr(t *testing.T) {
 	}, "expected interval sync error to surface through bgErr")
 }
 
+// waitForCondition 在截止时间内轮询条件是否成立。
 func waitForCondition(t *testing.T, deadline time.Duration, cond func() bool, onTimeout string) {
 	t.Helper()
 
