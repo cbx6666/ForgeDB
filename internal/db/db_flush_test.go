@@ -6,9 +6,11 @@ import (
 	"testing"
 )
 
-// ======== helpers (white-box safe) ========
+// db_flush_test.go 验证显式 flush 的状态转换、落盘安装和恢复语义。
 
-// read internal state under lock to avoid -race
+// ======== 测试辅助 ========
+
+// 在持锁状态下读取内部状态，避免与并发测试路径产生竞态。
 type flushState struct {
 	immNil  bool
 	memNil  bool

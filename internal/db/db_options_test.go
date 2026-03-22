@@ -5,6 +5,8 @@ import (
 	"time"
 )
 
+// db_options_test.go 验证默认选项和链式配置接口的行为。
+
 func TestDefaultOptions_UsesNeverSyncByDefault(t *testing.T) {
 	opt := DefaultOptions()
 

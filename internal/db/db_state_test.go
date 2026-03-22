@@ -2,6 +2,8 @@ package db
 
 import "testing"
 
+// db_state_test.go 验证版本视图和状态复制的只读语义。
+
 func TestNewVersionFromLevels_ClonesInput(t *testing.T) {
 	src := []level{
 		{

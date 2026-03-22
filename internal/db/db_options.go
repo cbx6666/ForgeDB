@@ -5,6 +5,8 @@ import (
 	"time"
 )
 
+// db_options.go 负责数据库选项、层级参数和默认配置逻辑。
+
 type LevelOptions struct {
 	// 触发 compaction 的阈值
 	maxFiles int

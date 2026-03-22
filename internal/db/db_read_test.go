@@ -7,6 +7,8 @@ import (
 	"monolithdb/internal/memtable"
 )
 
+// db_read_test.go 验证点查、范围读和多层来源合并语义。
+
 func TestDBScan_MergesMemImmAndSST(t *testing.T) {
 	dir := t.TempDir()
 

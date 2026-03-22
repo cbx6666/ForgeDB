@@ -6,7 +6,9 @@ import (
 	"time"
 )
 
-// ========== helpers ==========
+// db_compaction_test.go 验证 compaction 的选取、安装和层级约束。
+
+// ======== 测试辅助 ========
 
 // 断言：runs 按 minKey 升序，且不重叠（prev.maxKey < next.minKey）
 func assertRunsSortedNoOverlap(t *testing.T, runs []levelFile) {

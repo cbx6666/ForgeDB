@@ -7,6 +7,8 @@ import (
 	"monolithdb/internal/types"
 )
 
+// db_read.go 负责点查、范围读和迭代器逻辑。
+
 // Iterator 提供一个简单的只读范围迭代器。
 // 当前实现会先把范围结果物化到内存中，再按序遍历。
 type Iterator struct {
@@ -14,10 +16,12 @@ type Iterator struct {
 	idx     int
 }
 
+// Valid 返回当前迭代器位置是否有效。
 func (it *Iterator) Valid() bool {
 	return it != nil && it.idx < len(it.entries)
 }
 
+// Entry 返回当前迭代器位置上的记录。
 func (it *Iterator) Entry() types.Entry {
 	if !it.Valid() {
 		return types.Entry{}
@@ -25,6 +29,7 @@ func (it *Iterator) Entry() types.Entry {
 	return it.entries[it.idx]
 }
 
+// Next 将迭代器推进到下一条记录。
 func (it *Iterator) Next() error {
 	if it.Valid() {
 		it.idx++
@@ -32,7 +37,86 @@ func (it *Iterator) Next() error {
 	return nil
 }
 
+// Close 释放迭代器资源。
 func (it *Iterator) Close() error { return nil }
+
+// Get 按 memtable、immutable memtable、SST 的顺序执行点查。
+func (d *DB) Get(key string) ([]byte, bool, error) {
+	d.mu.RLock()
+	if err := d.checkBGErrLocked(); err != nil {
+		d.mu.RUnlock()
+		return nil, false, err
+	}
+
+	// 1) 先查活动内存表。
+	if e, ok := d.mem.GetAll(key); ok {
+		d.mu.RUnlock()
+		if e.Tombstone {
+			return nil, false, nil
+		}
+		return e.Value, true, nil
+	}
+
+	// 2) 再查正在 flush 的 immutable memtable。
+	if d.imm != nil {
+		if e, ok := d.imm.GetAll(key); ok {
+			d.mu.RUnlock()
+			if e.Tombstone {
+				return nil, false, nil
+			}
+			return e.Value, true, nil
+		}
+	}
+
+	// 3) 抓取当前版本，随后在锁外查询 SST。
+	view := readView{
+		version: d.currentVersion(),
+	}
+	d.mu.RUnlock()
+
+	levels := view.version.levels
+
+	// 4) 按层查询 SST。
+	for li := 0; li < len(levels); li++ {
+		lv := &levels[li]
+
+		if li == 0 {
+			// L0 按 newest-first 查找。
+			for _, p := range lv.l0Paths {
+				v, res, err := d.cache.Get(p, key)
+				if err != nil {
+					return nil, false, err
+				}
+				switch res {
+				case sstable.Found:
+					return v, true, nil
+				case sstable.Deleted:
+					return nil, false, nil
+				case sstable.NotFound:
+					continue
+				}
+			}
+		} else {
+			// L1 及以上先定位 run，再做单表查询。
+			if p, ok := findRun(lv.runs, key); ok {
+				v, res, err := d.cache.Get(p, key)
+				if err != nil {
+					return nil, false, err
+				}
+				switch res {
+				case sstable.Found:
+					return v, true, nil
+				case sstable.Deleted:
+					return nil, false, nil
+				case sstable.NotFound:
+					continue
+				}
+			}
+		}
+	}
+
+	return nil, false, nil
+}
 
 // Scan 返回 [start, end) 范围内当前可见的有序记录。
 // 返回结果会完成多层去重，并过滤 tombstone。
@@ -50,7 +134,6 @@ func (d *DB) Scan(start, end string) ([]types.Entry, error) {
 
 	// sources 的顺序就是“可见性优先级”：
 	// mem > imm > L0(newest-first) > L1+。
-	// 后面 merge 时，先出现的来源会屏蔽后面的旧值。
 	sources := make([][]types.Entry, 0, 2+len(view.version.levels))
 	sources = append(sources, memEntries)
 	if len(immEntries) > 0 {
@@ -75,7 +158,7 @@ func (d *DB) Scan(start, end string) ([]types.Entry, error) {
 			continue
 		}
 
-		// L>=1 的 run 不 overlap，先按范围过滤一遍，避免无意义的整表扫描。
+		// L>=1 的 run 不 overlap，先按范围过滤一遍。
 		for _, run := range lv.runs {
 			if !runOverlapsRange(run, start, end) {
 				continue
@@ -102,6 +185,7 @@ func (d *DB) NewIterator(start, end string) (*Iterator, error) {
 	return &Iterator{entries: entries}, nil
 }
 
+// captureScanSnapshot 在锁下抓取一次范围读所需的快照。
 func (d *DB) captureScanSnapshot(start, end string) ([]types.Entry, []types.Entry, readView, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -122,6 +206,7 @@ func (d *DB) captureScanSnapshot(start, end string) ([]types.Entry, []types.Entr
 	return memEntries, immEntries, view, nil
 }
 
+// scanSSTRange 扫描单张 SST 的指定范围。
 func scanSSTRange(path string, start, end string) ([]types.Entry, error) {
 	it, err := sstable.NewIter(path)
 	if err != nil {
@@ -133,7 +218,6 @@ func scanSSTRange(path string, start, end string) ([]types.Entry, error) {
 	for it.Valid() {
 		ent := it.Entry()
 
-		// 迭代器本身是全表顺序扫描，这里只保留范围内的部分。
 		if start != "" && ent.Key < start {
 			if err := it.Next(); err != nil {
 				return nil, err
@@ -156,6 +240,7 @@ func scanSSTRange(path string, start, end string) ([]types.Entry, error) {
 	return out, nil
 }
 
+// runOverlapsRange 判断某个 run 是否和给定范围有交集。
 func runOverlapsRange(run levelFile, start, end string) bool {
 	if start != "" && run.maxKey < start {
 		return false
@@ -166,11 +251,11 @@ func runOverlapsRange(run levelFile, start, end string) bool {
 	return true
 }
 
+// mergeScanSources 按可见性优先级合并多个来源的范围扫描结果。
 func mergeScanSources(sources [][]types.Entry) []types.Entry {
 	seen := make(map[string]types.Entry)
 	for _, src := range sources {
 		for _, ent := range src {
-			// 第一次出现的 key 就是当前可见版本，后面的旧值直接忽略。
 			if _, ok := seen[ent.Key]; ok {
 				continue
 			}
@@ -180,7 +265,6 @@ func mergeScanSources(sources [][]types.Entry) []types.Entry {
 
 	keys := make([]string, 0, len(seen))
 	for key, ent := range seen {
-		// tombstone 只负责遮蔽旧值，不应出现在最终 Scan 结果里。
 		if ent.Tombstone {
 			continue
 		}
@@ -200,6 +284,7 @@ func mergeScanSources(sources [][]types.Entry) []types.Entry {
 	return out
 }
 
+// cloneScanBytes 复制扫描结果里的值，避免共享底层切片。
 func cloneScanBytes(b []byte) []byte {
 	if b == nil {
 		return nil

@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+// db_flush_auto_test.go 验证自动 flush 的触发条件和后台行为。
+
 func TestDBAutoFlush_TriggersWithoutExplicitFlush(t *testing.T) {
 	dir := t.TempDir()
 

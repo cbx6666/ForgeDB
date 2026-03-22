@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+// db_write_sync_test.go 验证 WAL 同步策略和后台同步协作语义。
+
 // NeverSync 模式下，批量写路径不应触发 fsync。
 func TestDBWALSyncNever_DoesNotCallSync(t *testing.T) {
 	dir := t.TempDir()

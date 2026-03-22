@@ -1,17 +1,21 @@
-package db
+package dbtest
 
 import (
 	"bytes"
 	"path/filepath"
 	"sync"
 	"testing"
+
+	db "monolithdb/internal/db"
 )
+
+// integration_test.go 验证公开 API 的黑盒集成行为。
 
 func TestDBPutGet(t *testing.T) {
 	dir := t.TempDir()
 	dbDir := filepath.Join(dir, "data")
 
-	d, err := Open(dbDir)
+	d, err := db.Open(dbDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +41,7 @@ func TestDBPutFlushReopen(t *testing.T) {
 	dir := t.TempDir()
 	dbDir := filepath.Join(dir, "data")
 
-	d, err := Open(dbDir)
+	d, err := db.Open(dbDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +56,7 @@ func TestDBPutFlushReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	d2, err := Open(dbDir)
+	d2, err := db.Open(dbDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +79,7 @@ func TestDBDeleteTombstone(t *testing.T) {
 	dir := t.TempDir()
 	dbDir := filepath.Join(dir, "data")
 
-	d, err := Open(dbDir)
+	d, err := db.Open(dbDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +104,7 @@ func TestDBDeleteTombstone(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	d2, err := Open(dbDir)
+	d2, err := db.Open(dbDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +123,7 @@ func TestDBDeleteOverridesSST(t *testing.T) {
 	dir := t.TempDir()
 	dbDir := filepath.Join(dir, "data")
 
-	d, err := Open(dbDir)
+	d, err := db.Open(dbDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +155,7 @@ func TestDBConcurrentPuts(t *testing.T) {
 	dir := t.TempDir()
 	dbDir := filepath.Join(dir, "data")
 
-	d, err := Open(dbDir)
+	d, err := db.Open(dbDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,8 +169,10 @@ func TestDBConcurrentPuts(t *testing.T) {
 		i := i
 		go func() {
 			defer wg.Done()
-			if err := d.Put(k(i), v(i)); err != nil {
-				t.Errorf("put %s failed: %v", k(i), err)
+			key := makeTestKey(i)
+			val := makeTestValue(i)
+			if err := d.Put(key, val); err != nil {
+				t.Errorf("put %s failed: %v", key, err)
 			}
 		}()
 	}
@@ -177,12 +183,14 @@ func TestDBConcurrentPuts(t *testing.T) {
 	}
 
 	for i := 0; i < total; i++ {
-		got, ok, err := d.Get(k(i))
+		key := makeTestKey(i)
+		want := makeTestValue(i)
+		got, ok, err := d.Get(key)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !ok || !bytes.Equal(got, v(i)) {
-			t.Fatalf("want %s=%q, ok=%v got=%q", k(i), v(i), ok, got)
+		if !ok || !bytes.Equal(got, want) {
+			t.Fatalf("want %s=%q, ok=%v got=%q", key, want, ok, got)
 		}
 	}
 }
@@ -191,7 +199,7 @@ func TestDBWriteBatch_AppliesAllOperations(t *testing.T) {
 	dir := t.TempDir()
 	dbDir := filepath.Join(dir, "data")
 
-	d, err := Open(dbDir)
+	d, err := db.Open(dbDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +209,7 @@ func TestDBWriteBatch_AppliesAllOperations(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var batch WriteBatch
+	var batch db.WriteBatch
 	batch.Put("a", []byte("1"))
 	batch.Put("b", []byte("2"))
 	batch.Delete("stale")
@@ -239,12 +247,12 @@ func TestDBWriteBatch_FlushAndReopen(t *testing.T) {
 	dir := t.TempDir()
 	dbDir := filepath.Join(dir, "data")
 
-	d, err := Open(dbDir)
+	d, err := db.Open(dbDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	var batch WriteBatch
+	var batch db.WriteBatch
 	batch.Put("a", []byte("1"))
 	batch.Put("b", []byte("2"))
 	batch.Delete("missing")
@@ -259,7 +267,7 @@ func TestDBWriteBatch_FlushAndReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	d2, err := Open(dbDir)
+	d2, err := db.Open(dbDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,4 +288,12 @@ func TestDBWriteBatch_FlushAndReopen(t *testing.T) {
 			t.Fatalf("expected %s=%q, ok=%v got=%q", tc.key, tc.want, ok, got)
 		}
 	}
+}
+
+func makeTestKey(i int) string {
+	return string([]byte{byte('a' + i%26), byte('0' + (i/26)%10), byte('0' + (i/260)%10)})
+}
+
+func makeTestValue(i int) []byte {
+	return []byte{byte('v'), byte('0' + i%10), byte('0' + (i/10)%10)}
 }
