@@ -1,6 +1,6 @@
-# Internal Project Summary
+﻿# Internal Architecture
 
-本文档按 `internal/*` 目录总结当前项目的内部实现。目标不是写设计口号，而是把每个目录、每个文件、每个主要函数、每组测试在做什么说清楚，方便后续维护、重构和故障定位。
+本文件按 `internal/*` 目录整理当前项目的内部实现。
 
 ## 总览
 
@@ -22,7 +22,6 @@
 - 单 worker flush。
 - 单 worker compaction。
 - 读路径已开始快照化。
-- 旧 flush 单文件格式兼容已移除，新模型只认 `forge.flush.<gen>.wal`。
 
 ---
 
@@ -109,9 +108,9 @@
 - `TestWALReplay_TruncatedTailRecordIgnored`
   - 验证损坏尾部或截断尾部不会破坏前面的有效记录恢复。
 
-### 当前状态
+### 实现边界
 
-WAL 层是清晰和自洽的：
+WAL 层当前提供：
 
 - 支持单条与批量追加。
 - 支持显式同步。
@@ -177,9 +176,9 @@ WAL 层是清晰和自洽的：
 - `TestManifest_CheckpointLatest_CompactsToOneLineAndCanAppend`
   - 验证 checkpoint 后只剩最新快照，且后续仍可追加。
 
-### 当前状态
+### 实现边界
 
-Manifest 路径已经可用且闭环成立，但仍是“完整快照式”而非工业级 edit log。
+Manifest 当前采用完整快照式持久化，而不是 VersionEdit 式增量日志。
 
 ---
 
@@ -274,9 +273,9 @@ Manifest 路径已经可用且闭环成立，但仍是“完整快照式”而�
 - `TestMemTableReturnsClonedBytes`
   - 验证返回值已拷贝，不暴露内部切片。
 
-### 当前状态
+### 实现边界
 
-memtable 层语义清晰，但不是并发安全容器。并发安全由上层 DB 的写串行和快照边界保证。
+memtable 不是并发安全容器；并发安全由上层 DB 的单 writer、immutable 边界和读快照保证。
 
 ---
 
@@ -485,9 +484,9 @@ memtable 层语义清晰，但不是并发安全容器。并发安全由上层 D
   - `TestTableCache_EvictReloadsTable`
   - 验证缓存复用与驱逐重载。
 
-### 当前状态
+### 实现边界
 
-SSTable 层已经比较完整：
+SSTable 层当前提供：
 
 - 支持写表、点查、顺序迭代。
 - 有稀疏索引与 bloom。
@@ -1219,23 +1218,64 @@ SSTable 层已经比较完整：
 - `TestDB_Reopen_CleansOldCompactionInputsAfterManifestInstalled`
   - 验证 install 已写 MANIFEST 但旧文件未删时，重启会清理旧输入。
 
-### 当前状态
+### 实现要点
 
-`internal/db` 当前已具备以下自洽性：
+`internal/db` 的核心实现主线如下：
 
-- Version + MANIFEST 基本闭环。
-- writer queue + group commit 已成立。
-- active memtable / immutable queue / flush 单 worker 已自洽。
-- 读路径已开始快照化。
-- obsolete file 清理和恢复路径都有测试。
-- 单 worker compaction 的调度规则、安装规则和失败收口已较完整。
+- `Version + MANIFEST`
+  - flush 和 compaction 安装时会先持久化 MANIFEST，再切换 `current Version`。
+  - 打开数据库时优先从 MANIFEST 恢复层级布局。
 
-但当前仍不是工业级最终态：
+- `writer queue + group commit`
+  - 前台写请求统一进入写队列。
+  - `writeLoop` 负责聚合、写 WAL、按策略 sync、再应用到 active memtable。
 
-- Manifest 仍是 snapshot 式。
-- compaction 仍是单 worker。
-- 读路径 `Scan/Iterator` 仍偏物化，不是流式迭代器。
-- benchmark 体系还未建立。
+- `active memtable / immutable queue / flush`
+  - active memtable 写满或满足阈值后冻结成 immutable memtable。
+  - immutable memtable 进入队列。
+  - `flushLoop` 作为单 worker 只消费队头。
+  - immutable queue 具备背压机制，避免无限增长。
+
+- `读路径`
+  - `Get` 和 `Scan` 已按快照方式抓取当前读视图。
+  - active memtable 结果会先在锁内物化。
+  - immutable queue 和 SST 读取尽量锁外完成。
+
+- `obsolete file 清理`
+  - flush 安装后会清理对应 flush WAL。
+  - compaction 安装后会清理旧输入和被替换文件。
+  - 打开数据库时会清理 orphan SST 和临时文件。
+
+- `compaction`
+  - 当前为单 worker 模型。
+  - 已拆成调度、执行、安装三段。
+  - `pendingPaths` 负责避免重复选择同一批文件。
+  - install 失败和执行失败都有统一收口。
+
+对应的运行约束如下：
+
+- 主状态机边界比较清楚，便于维护。
+- 恢复路径与安装顺序一致，便于推导故障行为。
+- flush 和 compaction 都已经具备明确的后台执行模型。
+- 读写压缩三条主线已经能分开理解，而不是混在一个大文件里。
+
+### 功能边界
+
+以下列出当前实现已经包含和暂未包含的能力：
+
+- 已包含
+  - 单 writer
+  - immutable flush queue
+  - 单 worker flush
+  - 单 worker compaction
+  - 快照化起步的读路径
+  - WAL 恢复、flush 恢复、Manifest 恢复
+
+- 暂未包含
+  - VersionEdit / VersionSet 风格的增量版本管理
+  - 并行 compaction
+  - 流式 scan / iterator
+  - benchmark 体系
 
 ---
 
@@ -1278,40 +1318,73 @@ SSTable 层已经比较完整：
 - `makeTestValue`
   - 生成并发测试 value。
 
-### 当前状态
+### 测试定位
 
-`internal/dbtest` 目前主要覆盖公开 API 的端到端行为，和 `internal/db` 白盒测试形成互补：
+internal/dbtest 用于覆盖公开 API 的端到端行为，与 internal/db 中的白盒测试形成分工：
 
 - `internal/db` 偏白盒、规则、状态机测试。
 - `internal/dbtest` 偏黑盒、公开 API 和恢复结果测试。
 
 ---
 
-## 当前项目的整体评价
+## 测试覆盖总览
 
-只从“当前项目内部是否完整自洽、是否有明显致命问题”来看：
+当前已覆盖的主要测试路径如下：
 
-- 当前实现已经高于一般练手型原型。
-- 没有明显的致命架构问题。
-- 主要关键路径都有测试覆盖：
-  - WAL 恢复
-  - mem/immutables/flush
-  - compaction 调度与恢复
-  - tombstone 语义
-  - reopen 正确性
-  - 并发 Put
-  - WAL sync 策略
+1. WAL
+   - 追加与重放
+   - 批量追加
+   - 截断尾记录恢复
 
-当前更像：
+2. memtable
+   - put/get/overwrite/delete
+   - range
+   - 返回值拷贝
 
-- 一个高质量、结构清楚的单机 LSM 引擎雏形
-- 而不是工业级最终产品
+3. SSTable
+   - 写表与点查
+   - meta / index / bloom / iter
+   - table cache 复用与驱逐
+   - 部分损坏和越界场景
 
-最明显还欠缺的方向是：
+4. DB 写路径
+   - writer queue + group commit
+   - WAL sync 三种模式
+   - WriteBatch
+   - 并发 Put
 
-1. benchmark 体系。
-2. 更系统的故障注入矩阵。
-3. 更正式的 VersionSet / VersionEdit 模型。
-4. 流式 scan/iterator。
-5. 并行 compaction 设计与实现。
+5. DB flush
+   - 显式 flush
+   - auto flush
+   - immutable queue
+   - flush 背压
+   - flush WAL 恢复
+   - flush 产物安装前后重启恢复
+
+6. DB compaction
+   - 选层规则
+   - pendingPaths 约束
+   - 单步 compaction 执行
+   - install 失败收口
+   - tombstone 语义
+   - 多层推进
+   - orphan output 清理
+   - manifest 安装前后重启恢复
+
+7. 黑盒集成测试
+   - Put/Get
+   - Flush/Reopen
+   - Delete/tombstone
+   - 并发 Put
+   - WriteBatch 端到端行为
+
+## 文档范围
+
+本文件描述当前实现的模块职责、函数职责和测试覆盖。
+本文件不包含以下内容：
+
+- 性能 benchmark 报告
+- 并行 compaction 设计方案
+- 对外 API 使用教程
+- 版本演进历史
 

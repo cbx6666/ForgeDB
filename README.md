@@ -1,277 +1,215 @@
-# MonolithDB
+# ForgeDB
 
-MonolithDB 是一个单机、嵌入式、LSM 风格的 KV 存储引擎实验项目。  
-当前实现已经覆盖了写前日志、memtable、immutable flush、SSTable、后台 compaction、Version + Manifest 恢复闭环，以及一组较完整的白盒/黑盒测试。
+## 项目名称
 
-它目前更接近“高质量工程化原型”而不是工业级成品，但核心路径已经基本自洽。
+ForgeDB
 
-## 项目目标
+## 一、项目简介
 
-这个项目关注的是一条清晰、可验证的单机存储引擎主线：
+ForgeDB 是一个使用 Go 自研的单机嵌入式 KV 存储引擎项目，整体采用 LSM-Tree 风格架构。项目围绕存储引擎最核心的几条主线展开：写前日志保证持久化、MemTable 承接前台写入、SSTable 提供有序持久化存储、后台 Flush 与 Compaction 负责内存数据落盘和多层数据整理，最终形成一套较完整的单机存储引擎闭环。
 
-1. 写入统一进入 writer queue。
-2. `writeLoop` 做 group commit。
-3. 先写 WAL，再写 active memtable。
-4. active memtable 冻结为 immutable memtable，并进入 flush 队列。
-5. 后台 `flushLoop` 将 immutable memtable 刷成 SST。
-6. 后台 `compactionLoop` 执行层级压缩。
-7. 读路径按 `mem -> imms -> SST` 查找。
-8. `Version + Manifest` 负责版本切换与重启恢复。
+这个项目的目标并不是简单实现一个“能用的键值数据库”，而是尽可能按照真实存储引擎的思路，把写路径、读路径、后台任务、崩溃恢复和测试体系逐步做清楚。当前版本已经具备较完整的工程化原型特征，能够支持基础读写、批量写、后台刷盘、层级压缩、重启恢复以及一定程度的并发访问。
 
-## 当前能力
+## 二、项目目标
 
-### 写路径
+ForgeDB 主要关注以下几个方面：
 
-- 单 writer queue
-- group commit
-- `WALSyncNever / WALSyncEveryBatch / WALSyncInterval`
-- `WriteBatch` 批量写接口
-- 写路径会在 flush 队列满时触发背压
+1. 构建一条清晰、自洽、可恢复的单机存储引擎主线。
+2. 用工程化方式实现 LSM-Tree 核心组件，而不是只做概念演示。
+3. 在保证正确性的前提下，逐步引入更合理的并发控制和后台调度机制。
+4. 通过白盒测试和黑盒测试验证数据正确性、恢复逻辑和后台状态机行为。
+5. 为后续继续扩展为更完整的存储内核打下基础。
 
-### 内存与落盘
+## 三、整体架构
 
-- active memtable
-- immutable memtable 队列
-- 后台单 worker flush
-- 每份 immutable memtable 对应独立 `forge.flush.<gen>.wal`
-- 支持显式 `Flush()` 和阈值驱动的 auto flush
+ForgeDB 当前采用典型的 LSM 风格分层设计，其核心数据流如下：
 
-### 读路径
+前台写入首先进入 writer queue，由后台 `writeLoop` 统一进行 group commit。写入先追加到 WAL，再应用到当前 active MemTable。当 active MemTable 达到阈值后，会被冻结为 immutable MemTable，并进入 flush 队列。后台 flush worker 将 immutable MemTable 刷写成新的 SSTable 文件。随着 L0 文件持续累积，后台 compaction worker 会选择合适的层级和文件集合执行压缩，将数据逐步推进到更深层级，并清理冗余版本与可丢弃的墓碑记录。
 
-- `Get`
-- `Scan`
-- 简单 `Iterator`
-- 读路径已做快照化起步
-- `Get` 与 `Scan` 返回值会拷贝，不暴露内部切片
+读取路径则按照“内存优先、磁盘兜底”的思路工作：先查 active MemTable，再查 immutable 队列，最后再查 SSTable。SSTable 层使用稀疏索引、Bloom Filter 和表元信息缓存来减少无效 IO，提高点查效率。
 
-### SSTable
+为了在崩溃后恢复系统状态，ForgeDB 引入了 WAL、flush WAL、Manifest 快照以及目录扫描恢复机制，保证数据库在重启时能够尽可能恢复到一致状态。
 
-- SST 写出
-- 点查
-- 顺序迭代
+## 四、核心功能
+
+### 1. 基础 KV 接口
+
+ForgeDB 提供 `Put`、`Get`、`Delete`、`WriteBatch`、`Scan` 和 `Iterator` 等基础接口，支持单键读写、删除、批量写入以及范围扫描。
+
+### 2. WAL 持久化
+
+所有前台写入都会先进入 WAL，再应用到内存结构中，保证崩溃恢复时能够通过日志重放找回尚未落盘的数据。
+
+### 3. Group Commit 写入路径
+
+前台写请求不会直接各自落盘，而是统一进入 writer queue，由后台 `writeLoop` 聚合成批次统一写 WAL 并应用到 MemTable，从而减少频繁刷盘带来的额外开销。
+
+### 4. 可配置 WAL 同步策略
+
+系统当前支持多种 WAL 同步模式，包括：
+
+- `WALSyncNever`：不主动对每批写入执行 `fsync`
+- `WALSyncEveryBatch`：每个批次写入后立即 `fsync`
+- `WALSyncInterval`：由后台周期性执行 `fsync`
+
+这使得系统可以在吞吐与持久化开销之间做权衡。
+
+### 5. MemTable 与 Immutable Queue
+
+系统使用 SkipList 作为 MemTable 的核心有序结构。当前 active MemTable 达到条件后会被冻结，并进入 immutable 队列。后台 flush worker 只消费队头 immutable，形成更清晰的刷盘调度模型。为了避免后台落盘过慢导致内存无限增长，写路径还引入了 flush 背压机制。
+
+### 6. SSTable 持久化存储
+
+ForgeDB 已实现 SSTable 的写出、点查和顺序迭代，并在文件层支持：
+
 - 稀疏索引
-- bloom filter
-- table cache
+- Bloom Filter
+- 边界元信息
+- Table Cache
 
-### 压缩
+这些机制共同支撑了较高效的磁盘查询路径。
 
-- 单 worker compaction
-- L0 -> L1 -> L2 多层推进
-- tombstone 底层丢弃
-- `pendingPaths` 防止重复挑选同一批文件
-- pick / run / install 已拆分，语义相对清楚
+### 7. 多层 Compaction
 
-### 恢复与清理
+系统已支持多层 SSTable 的后台压缩，能够将 L0 文件逐步向更深层级推进。压缩过程会处理同 key 多版本去重、tombstone 传播与底层丢弃等语义，并借助 `pendingPaths` 防止重复挑选同一批文件。
 
-- WAL 重放恢复
-- flush WAL 恢复
-- Manifest 快照恢复
-- 无 Manifest 时目录扫描恢复
-- orphan SST 清理
-- `.tmp` 临时文件清理
+### 8. 崩溃恢复与文件清理
 
-## 当前并发模型
+数据库重启时会优先从 Manifest 恢复层级布局，在必要时也可通过目录扫描重建版本信息。同时系统支持恢复 active WAL、flush WAL，并清理 orphan SST、遗留临时文件等异常状态文件，使恢复链路形成闭环。
 
-当前项目不是全路径并行，而是刻意做成几条清晰边界：
+## 五、技术实现要点
 
-- 写入：单 writer，后台 `writeLoop` 串行提交
-- flush：immutable queue + 单 worker
-- compaction：单 worker
-- 读取：快照化后尽量锁外读 immutable/SST
+### 1. LSM-Tree 存储模型
 
-也就是说，它现在强调的是：
+项目整体采用内存写入、顺序落盘、后台归并的设计思路。相比直接原地更新磁盘数据，LSM 更适合高写入吞吐场景，同时也更便于通过 WAL 和后台任务组织系统状态。
 
-- 正确性优先
-- 恢复闭环优先
-- 状态机可解释优先
+### 2. SkipList MemTable
 
-而不是一开始就追极限并行度。
+内存表使用 SkipList 维护键有序性，既能支持高效点查，也便于后续范围扫描和顺序刷盘。
 
-## 目录结构
+### 3. Writer Queue 与写串行化
 
-### `internal/types`
+为了简化并发写入下的状态一致性问题，当前版本采用单 writer queue 模型，将前台写请求统一交给后台 `writeLoop` 处理。这不是简单的“并发不足”，而是一种以正确性和状态清晰度为优先的工程取舍。
 
-基础逻辑记录类型，目前主要是 `types.Entry`。
+### 4. Immutable Queue 与 Flush 背压
 
-### `internal/wal`
+与早期单 immutable 槽位模型不同，当前实现已经扩展为 immutable 队列。这样可以更清楚地组织前台写入、后台刷盘和内存占用之间的关系，并在队列满时阻塞前台写入，避免系统失控。
 
-WAL 追加、批量追加、同步与重放。
+### 5. Version + Manifest 恢复模型
 
-### `internal/manifest`
+系统当前采用快照式 Manifest 记录全局层级布局。在 Flush 或 Compaction 安装新版本时，会先持久化 Manifest，再切换当前内存中的 Version，从而保证恢复时能够找到一致的文件布局。
 
-Manifest 快照持久化与加载。  
-当前是 snapshot-style manifest，不是 VersionEdit 日志模型。
+### 6. Pick / Run / Install 分离的 Compaction 设计
 
-### `internal/memtable`
+Compaction 逻辑被拆分为挑选任务、执行合并、安装新版本三个阶段，使后台压缩的职责边界更清晰，也便于后续继续扩展为更复杂的调度与并行模型。
 
-skiplist 驱动的 memtable，实现 put/get/delete/range。
+## 六、当前并发模型
 
-### `internal/sstable`
+ForgeDB 目前更强调“正确性优先、恢复优先、状态边界清晰”，而不是一开始就追求极限并行度。当前并发模型可以概括为：
 
-SST 文件格式、顺序迭代、点查、meta、index、bloom、table cache。
+- 写入路径：单 writer queue，后台串行 group commit
+- Flush 路径：immutable queue + 单 worker
+- Compaction 路径：单 worker
+- 读取路径：在抓取快照后尽量锁外读取 immutable 和 SSTable
 
-### `internal/db`
+这种设计的好处是系统状态机更容易解释，Flush 与 Compaction 的行为边界更清楚，也更适合作为一个逐步演进的存储引擎项目。
 
-引擎主目录，按职责拆成：
+## 七、测试覆盖
 
-- `db_state.go`
-  - 核心状态定义
-- `db_open_close.go`
-  - 打开、关闭、Manifest 持久化
-- `db_options.go`
-  - 配置项和默认配置
-- `db_write.go`
-  - writer queue、group commit、WAL sync
-- `db_read.go`
-  - `Get / Scan / Iterator`
-- `db_flush.go`
-  - immutable queue、flush worker、auto flush、背压
-- `db_storage.go`
-  - version 构造、恢复、目录扫描、文件工具
-- `db_compaction.go`
-  - compaction 入口与主循环
-- `db_compaction_picker.go`
-  - compaction job 挑选与 pending 管理
-- `db_compaction_run.go`
-  - compaction 执行与多路归并
-- `db_compaction_install.go`
-  - compaction 安装、旧文件清理、失败收口
+ForgeDB 当前已经建立了较系统的测试体系，覆盖范围包括：
 
-### `internal/dbtest`
+### 1. WAL 层
 
-黑盒集成测试，只通过公开 API 验证端到端行为。
-
-### `docs`
-
-目前包含：
-
-- [docs/internal-architecture.md](docs/internal-architecture.md)
-  - 按 `internal/*` 目录逐个总结实现与测试覆盖
-
-## 主要设计点
-
-### 1. Version + Manifest
-
-当前版本管理是“完整快照式”：
-
-- flush / compaction 安装时先持久化 Manifest
-- 成功后再切换内存中的 `current Version`
-- 打开数据库时优先从 Manifest 恢复
-- Manifest 不可用时可退化到目录扫描恢复
-
-这保证了当前模型下的基本恢复闭环。
-
-### 2. writer queue + group commit
-
-前台 `Put/Delete/Write(batch)` 不直接落盘，而是进入写队列。  
-后台 `writeLoop` 会在一个很短的时间窗口内聚合请求，统一：
-
-1. 追加 WAL
-2. 按 sync 策略决定是否 fsync
-3. 应用到 active memtable
-4. 处理 flush 背压
-
-### 3. immutable queue + flush
-
-当前 flush 模型不是单个 `imm` 槽位，而是 immutable queue：
-
-- active memtable 满足条件后冻结成 immutable
-- immutable 入队
-- 后台 `flushLoop` 只消费队头
-- 队列达到上限后，写路径会被背压阻塞
-
-### 4. 单 worker compaction
-
-当前 compaction 暂时不做多 worker，而是把单 worker 做清楚：
-
-- 选择最值得压缩的层
-- 构造 `compactionJob`
-- 多路归并生成新 runs
-- 安装版本
-- 删除旧文件
-- 清 pending
-- 失败统一收口到 `bgErr`
-
-这样后续如果要上并行 compaction，地基已经比较清楚。
-
-## 测试覆盖
-
-### `internal/wal`
-
-- WAL 追加与重放
-- 批量追加
+- 单条记录与批量记录追加
+- WAL 重放
 - 截断尾记录恢复
 
-### `internal/manifest`
+### 2. Manifest 层
 
-- 快照写入与加载
+- 快照写入与读取
 - 尾部损坏容忍
-- checkpoint 后继续追加
+- Checkpoint 之后继续追加
 
-### `internal/memtable`
+### 3. MemTable 层
 
-- put/get/overwrite/delete
-- range
-- 返回值拷贝
+- `Put / Get / Overwrite / Delete`
+- 范围扫描
+- 返回值拷贝，避免暴露内部切片
 
-### `internal/sstable`
+### 4. SSTable 层
 
-- SST 写表与点查
-- magic 校验
-- iter 顺序扫描
-- meta 边界读取
-- index 范围裁剪与损坏处理
-- table cache 复用与驱逐
+- 写表与点查
+- 迭代器顺序扫描
+- 稀疏索引边界
+- Bloom miss 快速跳过
+- Table Cache 复用与驱逐
 
-### `internal/db`
+### 5. DB 主路径
 
-- Version 深拷贝语义
 - WAL sync 三种模式
-- `Get / Scan / Iterator`
-- auto flush
-- flush 队列与背压
-- flush/reopen/crash 恢复
-- compaction 规则测试
-- compaction 后数据正确性
-- compaction orphan output 清理
-- compaction install 前后崩溃恢复
+- Group commit
+- Auto Flush
+- Flush 队列与背压
+- Flush/Reopen/Crash 恢复
+- Compaction 规则与最终正确性
+- Tombstone 语义
+- 后台错误暴露
+- 多层推进与文件清理
 
-### `internal/dbtest`
+### 6. 黑盒集成测试
 
-- Put/Get
-- Flush/Reopen
-- Tombstone 覆盖旧值
-- 并发 Put
-- WriteBatch 端到端行为
+系统还提供了只通过公开 API 进行验证的集成测试，用于检查端到端的读写、刷盘、重启恢复、批量写和并发写行为。
 
-## 当前状态评价
+## 八、项目特点与亮点
 
-如果只看“完整自洽”和“是否有明显致命问题”，当前项目可以这样评价：
+### 1. 不只是“组件拼装”，而是完整主路径闭环
 
-- 已经过了简单练手原型阶段
-- 主要路径基本自洽
-- 恢复主线基本闭环
-- 没有明显致命架构问题
+ForgeDB 并不是简单实现了 WAL、MemTable、SSTable 这些单点模块，而是把它们串成了一条完整的存储引擎主线，包括前台写入、后台刷盘、后台压缩和崩溃恢复。
 
-但它仍然不是工业级最终产品，当前仍欠缺：
+### 2. 强调工程边界而不是单纯追求功能数量
 
-- benchmark 体系
-- 更系统的故障注入矩阵
-- 更正式的 VersionSet / VersionEdit 模型
-- 流式 scan / iterator
-- 并行 compaction
+项目在写路径、Flush、Compaction 和恢复逻辑上都刻意保持职责边界清晰，例如 writer queue、immutable queue、pendingPaths、Manifest 快照等设计，都体现了对系统状态机的关注。
 
-## 后续方向
+### 3. 具备较强的可解释性和可扩展性
 
-如果继续往前推进，最自然的路线是：
+当前实现虽然不是工业级成品，但整体结构清楚，便于继续扩展更正式的版本管理、更高并发度的后台任务、流式读路径和性能基线测试。
 
-1. benchmark 与性能基线
-2. 更系统的 flush + compaction 交错恢复测试
-3. 更正式的 Version / Manifest 模型
-4. 流式读路径
-5. 并行 compaction
+### 4. 恢复与测试意识较强
 
-## 参考文档
+相比只关注读写功能的简单项目，ForgeDB 对崩溃恢复、文件遗留状态、后台错误暴露和恢复闭环有更完整的考虑，也配套编写了较系统的测试。
 
-- [docs/internal-architecture.md](docs/internal-architecture.md)
+## 九、当前限制
+
+ForgeDB 当前已经具备较完整的工程化原型特征，但仍然不是工业级最终产品。当前主要限制包括：
+
+1. Manifest 仍是完整快照式模型，而不是更细粒度的 VersionEdit 日志模型。
+2. Compaction 仍为单 worker，尚未实现并行压缩。
+3. `Scan` 和 `Iterator` 仍偏向物化结果集，尚未完全演进为流式读路径。
+4. benchmark 体系尚未系统建立，性能表现还缺少标准化评估。
+5. 更复杂的并发语义，例如事务、MVCC、细粒度读写隔离，仍未引入。
+
+## 十、后续计划
+
+后续如果继续推进，ForgeDB 计划重点完善以下方向：
+
+1. 建立 benchmark 体系，形成更清晰的吞吐、延迟与恢复性能基线。
+2. 增强故障注入与恢复测试矩阵，进一步验证复杂交错场景下的一致性。
+3. 继续演进 Version / Manifest 模型，提高版本切换与恢复机制的正式程度。
+4. 将 `Scan / Iterator` 逐步改造成更高效的流式读路径。
+5. 探索更高阶的并发控制方案与并行 Compaction 设计。
+
+## 十一、适用场景
+
+ForgeDB 当前适合作为：
+
+- 自研数据库或存储引擎方向的学习与实践项目
+- LSM-Tree、WAL、SSTable、Compaction 等核心机制的教学和展示样例
+- 简历、面试、复试中展示系统能力和工程能力的项目
+- 后续继续扩展为更完整单机存储内核的基础版本
+
+## 十二、总结
+
+ForgeDB 是一个围绕单机 LSM 存储引擎主线逐步构建的工程化项目。它当前已经实现了较完整的写路径、读路径、后台 Flush、层级 Compaction、恢复闭环与测试体系，整体完成度已经明显超过一般的课程作业或概念性原型。
+
+虽然它仍然不是工业级数据库，但它已经具备了“高质量工程化存储引擎原型”的特征。对于一个自研数据库方向的个人项目来说，ForgeDB 的重点不只是实现功能，更在于通过清晰的结构、明确的状态边界和较完整的恢复逻辑，展示存储系统设计与实现的全过程。
 
