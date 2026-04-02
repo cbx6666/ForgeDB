@@ -246,12 +246,30 @@ func (d *DB) shouldAutoFlushLocked() bool {
 		d.mem.ApproxSize() >= d.opt.autoFlushBytes
 }
 
+// flushQueueFullLocked 判断 immutable queue 是否已经达到上限。
+func (d *DB) flushQueueFullLocked() bool {
+	return d.opt.maxImmutableMems > 0 && len(d.imms) >= d.opt.maxImmutableMems
+}
+
 // hasFlushWorkLocked 判断当前是否仍有待刷数据或在途 flush 工作。
 func (d *DB) hasFlushWorkLocked() bool {
 	if len(d.imms) > 0 || d.flush.running || d.flush.job != nil {
 		return true
 	}
 	return d.mem != nil && d.mem.ApproxSize() > 0
+}
+
+// waitFlushQueueRoomLocked 等待 immutable queue 出现空位。
+func (d *DB) waitFlushQueueRoomLocked() error {
+	for d.bgErr == nil && !d.closing && d.flushQueueFullLocked() {
+		// 队列已满时，持续推动后台 worker 消化队头。
+		d.requestFlushLocked()
+		d.flush.cond.Wait()
+	}
+	if d.closing {
+		return errDBClosed
+	}
+	return d.checkBGErrLocked()
 }
 
 // waitFlushDoneLocked 等待 flush 至少推进到目标代际。
@@ -269,6 +287,9 @@ func (d *DB) waitFlushDoneLocked(target uint64) error {
 func (d *DB) enqueueActiveMemtableLocked() (*immutableMem, error) {
 	if d.mem == nil || d.mem.ApproxSize() == 0 {
 		return nil, nil
+	}
+	if err := d.waitFlushQueueRoomLocked(); err != nil {
+		return nil, err
 	}
 
 	immMem := d.freezeActiveMemLocked()

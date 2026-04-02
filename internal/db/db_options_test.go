@@ -17,6 +17,9 @@ func TestDefaultOptions_UsesNeverSyncByDefault(t *testing.T) {
 	if opt.walSyncInterval <= 0 {
 		t.Fatalf("expected positive default walSyncInterval, got %s", opt.walSyncInterval)
 	}
+	if opt.maxImmutableMems <= 0 {
+		t.Fatalf("expected positive default maxImmutableMems, got %d", opt.maxImmutableMems)
+	}
 }
 
 // TestOptionsWithWALSync_ConfiguresIntervalMode 验证 interval 模式会记录给定同步周期。
@@ -50,5 +53,14 @@ func TestOptionsWithAutoFlushBytes_ConfiguresThreshold(t *testing.T) {
 
 	if opt.autoFlushBytes != 4096 {
 		t.Fatalf("expected autoFlushBytes=4096, got %d", opt.autoFlushBytes)
+	}
+}
+
+// TestOptionsWithMaxImmutableMems_ConfiguresQueueLimit 验证 immutable queue 上限配置会生效。
+func TestOptionsWithMaxImmutableMems_ConfiguresQueueLimit(t *testing.T) {
+	opt := DefaultOptions().WithMaxImmutableMems(2)
+
+	if opt.maxImmutableMems != 2 {
+		t.Fatalf("expected maxImmutableMems=2, got %d", opt.maxImmutableMems)
 	}
 }

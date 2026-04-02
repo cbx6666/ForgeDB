@@ -31,11 +31,12 @@ const (
 )
 
 type Options struct {
-	numLevels       int
-	levels          []LevelOptions
-	walSync         WALSyncMode
-	walSyncInterval time.Duration
-	autoFlushBytes  int
+	numLevels        int
+	levels           []LevelOptions
+	walSync          WALSyncMode
+	walSyncInterval  time.Duration
+	autoFlushBytes   int
+	maxImmutableMems int
 }
 
 // DefaultOptions 返回一份可供调用方修改的默认配置副本。
@@ -60,6 +61,15 @@ func (opt Options) WithAutoFlushBytes(bytes int) Options {
 	return opt
 }
 
+// WithMaxImmutableMems 返回一份带有 immutable queue 上限的新配置。
+// max <= 0 表示使用默认值。
+func (opt Options) WithMaxImmutableMems(max int) Options {
+	if max > 0 {
+		opt.maxImmutableMems = max
+	}
+	return opt
+}
+
 // defaultOptions 返回内部使用的默认配置模板。
 func defaultOptions() Options {
 	return Options{
@@ -69,9 +79,10 @@ func defaultOptions() Options {
 			{maxFiles: 8, pickN: 1, runMaxEntries: 256},
 			{maxFiles: 0, pickN: 0, runMaxEntries: 1024},
 		},
-		walSync:         WALSyncNever,
-		walSyncInterval: 10 * time.Millisecond,
-		autoFlushBytes:  0,
+		walSync:          WALSyncNever,
+		walSyncInterval:  10 * time.Millisecond,
+		autoFlushBytes:   0,
+		maxImmutableMems: 4,
 	}
 }
 
@@ -95,6 +106,9 @@ func validateOptions(opt Options) error {
 	}
 	if opt.autoFlushBytes < 0 {
 		return fmt.Errorf("db: autoFlushBytes must be >= 0")
+	}
+	if opt.maxImmutableMems <= 0 {
+		return fmt.Errorf("db: maxImmutableMems must be > 0")
 	}
 
 	for i := 0; i < opt.numLevels; i++ {

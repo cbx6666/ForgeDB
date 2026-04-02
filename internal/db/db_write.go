@@ -196,6 +196,15 @@ func (d *DB) applyWriteBatch(batch []*writeReq) {
 			applyBatchToMemtable(d.mem, batch)
 			if d.shouldAutoFlushLocked() {
 				d.requestAutoFlush()
+				for d.bgErr == nil && !d.closing && d.shouldAutoFlushLocked() && d.flushQueueFullLocked() {
+					// immutable queue 已满且 active mem 继续超过阈值时，写入方要等待后台 flush 腾出空位，
+					// 否则 active mem 会持续膨胀，背压就失效了。
+					d.requestFlushLocked()
+					d.flush.cond.Wait()
+				}
+				if d.bgErr != nil {
+					err = d.bgErr
+				}
 			}
 		} else {
 			d.bgErr = err

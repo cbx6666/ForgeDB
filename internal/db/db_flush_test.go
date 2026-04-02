@@ -3,8 +3,12 @@ package db
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
+
+	"monolithdb/internal/memtable"
+	"monolithdb/internal/wal"
 )
 
 // db_flush_test.go 验证显式 flush 的状态转换、落盘安装和恢复语义。
@@ -525,6 +529,96 @@ func TestDB_FlushQueue_SecondImmutableBecomesNewHead(t *testing.T) {
 	// 最后走公开 Flush，把第二份队列数据也完全落盘，避免残留影响后续状态。
 	if err := d.Flush(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestDB_FlushQueue_BackpressureWaitsForRoom 验证 immutable queue 满时，新的冻结入队会等待空位出现。
+func TestDB_FlushQueue_BackpressureWaitsForRoom(t *testing.T) {
+	dir := t.TempDir()
+
+	opt := DefaultOptions().WithMaxImmutableMems(1)
+	sstDir := filepath.Join(dir, "sst")
+	if err := os.MkdirAll(filepath.Join(sstDir, "l0"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(sstDir, "l1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(sstDir, "l2"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	walPath := filepath.Join(dir, "forge.wal")
+	w, err := wal.Open(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := &DB{
+		mem:     memtable.NewMemTable(),
+		wal:     w,
+		dir:     dir,
+		walPath: walPath,
+		sstDir:  sstDir,
+		current: newVersionFromLevels([]level{
+			{id: 0, dir: filepath.Join(sstDir, "l0")},
+			{id: 1, dir: filepath.Join(sstDir, "l1")},
+			{id: 2, dir: filepath.Join(sstDir, "l2")},
+		}),
+		opt: opt,
+	}
+	d.flush.cond = sync.NewCond(&d.mu)
+	defer func() {
+		if d.wal != nil {
+			_ = d.wal.Close()
+		}
+	}()
+
+	d.mem.Put("k1", []byte("v1"))
+
+	d.mu.Lock()
+	imm1, err := d.enqueueActiveMemtableLocked()
+	if err != nil {
+		d.mu.Unlock()
+		t.Fatal(err)
+	}
+	if imm1 == nil {
+		d.mu.Unlock()
+		t.Fatal("expected first immutable memtable")
+	}
+	d.mu.Unlock()
+
+	d.mem.Put("k2", []byte("v2"))
+
+	done := make(chan error, 1)
+	go func() {
+		d.mu.Lock()
+		_, err := d.enqueueActiveMemtableLocked()
+		d.mu.Unlock()
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("expected enqueue to wait for queue room, got early result: %v", err)
+	case <-time.After(80 * time.Millisecond):
+	}
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		d.mu.Lock()
+		d.imms = d.imms[1:]
+		d.flush.cond.Broadcast()
+		d.mu.Unlock()
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("expected enqueue to succeed after room is available, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected enqueue to resume after queue room was freed")
 	}
 }
 
