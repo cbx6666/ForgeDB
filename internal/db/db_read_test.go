@@ -33,9 +33,10 @@ func TestDBScan_MergesMemImmAndSST(t *testing.T) {
 	}
 
 	d.mu.Lock()
-	d.imm = memtable.NewMemTable()
-	d.imm.Put("c", []byte("3"))
-	d.imm.Delete("b")
+	imm := &immutableMem{mem: memtable.NewMemTable()}
+	imm.mem.Put("c", []byte("3"))
+	imm.mem.Delete("b")
+	d.imms = append(d.imms, imm)
 	d.mem.Put("a", []byte("4"))
 	d.mem.Put("d", []byte("5"))
 	d.mu.Unlock()
@@ -77,9 +78,10 @@ func TestDBIterator_RespectsRangeBounds(t *testing.T) {
 	}
 
 	d.mu.Lock()
-	d.imm = memtable.NewMemTable()
-	d.imm.Put("c", []byte("3"))
-	d.imm.Delete("b")
+	imm := &immutableMem{mem: memtable.NewMemTable()}
+	imm.mem.Put("c", []byte("3"))
+	imm.mem.Delete("b")
+	d.imms = append(d.imms, imm)
 	d.mem.Put("d", []byte("4"))
 	d.mu.Unlock()
 

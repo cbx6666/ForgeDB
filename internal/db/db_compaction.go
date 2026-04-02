@@ -126,9 +126,6 @@ func (d *DB) compactionLoop() {
 				break
 			}
 			if job == nil {
-				d.mu.Lock()
-				// 没有可执行 job 通常意味着都被 pending 占住了，先退出本轮等待下一次请求。
-				d.mu.Unlock()
 				break
 			}
 

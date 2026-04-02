@@ -4,10 +4,11 @@ import (
 	"errors"
 	"time"
 
+	"monolithdb/internal/memtable"
 	"monolithdb/internal/wal"
 )
 
-// db_write.go 负责前台写入接口、写入调度和 WAL 同步逻辑。
+// db_write.go 负责公开写接口、写请求提交、后台 group commit 和 WAL 同步逻辑。
 
 const (
 	writeBatchMaxCount = 128
@@ -35,7 +36,7 @@ type writeReq struct {
 // errDBClosed 表示数据库已经关闭，不能再接收新的写请求。
 var errDBClosed = errors.New("db: closed")
 
-// WriteBatch 用于收集多条要一起提交的变更。
+// WriteBatch 用于收集一组要一起提交的变更。
 // 零值可直接使用。
 type WriteBatch struct {
 	ops []batchOp
@@ -72,9 +73,14 @@ func (b *WriteBatch) Len() int {
 	return len(b.ops)
 }
 
-// Put 提交单条写请求。
+// Put 提交单条写入请求。
 func (d *DB) Put(key string, value []byte) error {
 	return d.submitWrite(writeOpPut, key, value)
+}
+
+// Delete 提交单条删除请求。
+func (d *DB) Delete(key string) error {
+	return d.submitWrite(writeOpDelete, key, nil)
 }
 
 // Write 提交一组 Put/Delete 组成的批量写请求。
@@ -85,12 +91,7 @@ func (d *DB) Write(batch *WriteBatch) error {
 	return d.submitWriteBatch(batch.ops)
 }
 
-// Delete 提交单条删除请求。
-func (d *DB) Delete(key string) error {
-	return d.submitWrite(writeOpDelete, key, nil)
-}
-
-// submitWrite 把单条写请求包装成批量接口，复用统一提交流程。
+// submitWrite 把单条写请求包装成批量接口，复用统一的提交流程。
 func (d *DB) submitWrite(op writeOp, key string, value []byte) error {
 	return d.submitWriteBatch([]batchOp{{
 		op:    op,
@@ -99,28 +100,18 @@ func (d *DB) submitWrite(op writeOp, key string, value []byte) error {
 	}})
 }
 
-// submitWriteBatch 把一批写操作投递到后台写协程。
+// submitWriteBatch 把一批写操作投递到后台 writeLoop。
 func (d *DB) submitWriteBatch(ops []batchOp) error {
 	if len(ops) == 0 {
 		return nil
 	}
 
-	cloned := make([]batchOp, len(ops))
-	for i, op := range ops {
-		cloned[i] = batchOp{
-			op:    op.op,
-			key:   op.key,
-			value: cloneWriteValue(op.value),
-		}
-	}
-
 	req := &writeReq{
-		ops:  cloned,
+		ops:  cloneBatchOps(ops),
 		done: make(chan error, 1),
 	}
 
-	// 写入入口和 Close 会竞争写通道，因此这里先检查关闭状态，
-	// 再把请求投递给后台 writeLoop。
+	// 写入口和 Close 会竞争写通道，因此这里先检查关闭状态，再把请求交给后台。
 	d.write.mu.RLock()
 	if d.write.closed {
 		d.write.mu.RUnlock()
@@ -132,7 +123,7 @@ func (d *DB) submitWriteBatch(ops []batchOp) error {
 	return <-req.done
 }
 
-// writeLoop 在后台聚合前台写请求并执行 group commit。
+// writeLoop 在后台聚合前台写请求，并执行 group commit。
 func (d *DB) writeLoop() {
 	defer d.wg.Done()
 
@@ -142,37 +133,42 @@ func (d *DB) writeLoop() {
 			return
 		}
 
-		// 先拿到第一条请求，再用一个很短的时间窗继续聚合。
-		batch := []*writeReq{first}
-		timer := time.NewTimer(writeBatchMaxDelay)
-		closed := false
-
-	collect:
-		for len(batch) < writeBatchMaxCount {
-			select {
-			case req, ok := <-d.write.ch:
-				if !ok {
-					closed = true
-					break collect
-				}
-				batch = append(batch, req)
-			case <-timer.C:
-				break collect
-			}
-		}
-
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-
+		batch, closed := d.collectWriteBatch(first)
 		d.applyWriteBatch(batch)
 		if closed {
 			return
 		}
 	}
+}
+
+// collectWriteBatch 以短时间窗口继续吸收后续请求，形成一轮 group commit。
+func (d *DB) collectWriteBatch(first *writeReq) ([]*writeReq, bool) {
+	batch := []*writeReq{first}
+	timer := time.NewTimer(writeBatchMaxDelay)
+	closed := false
+
+collect:
+	for len(batch) < writeBatchMaxCount {
+		select {
+		case req, ok := <-d.write.ch:
+			if !ok {
+				closed = true
+				break collect
+			}
+			batch = append(batch, req)
+		case <-timer.C:
+			break collect
+		}
+	}
+
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+
+	return batch, closed
 }
 
 // applyWriteBatch 在 WAL 和 MemTable 上原子地应用一批写请求。
@@ -181,29 +177,10 @@ func (d *DB) applyWriteBatch(batch []*writeReq) {
 
 	err := d.checkBGErrLocked()
 	if err == nil {
-		totalOps := 0
-		for _, req := range batch {
-			totalOps += len(req.ops)
-		}
+		records := buildWALRecords(batch)
 
-		records := make([]wal.Record, 0, totalOps)
-		for _, req := range batch {
-			for _, op := range req.ops {
-				rec := wal.Record{
-					Key:   op.key,
-					Value: op.value,
-				}
-				if op.op == writeOpDelete {
-					rec.Op = 1
-				} else {
-					rec.Op = 0
-				}
-				records = append(records, rec)
-			}
-		}
-
-		// 先批量写 WAL，再按策略 fsync，最后按原顺序应用到 MemTable。
-		// 保持 WAL-before-mem 语义，避免 mem 已可见但 WAL 尚未持久化。
+		// 先批量写 WAL，再按策略 fsync，最后按原顺序写入 memtable。
+		// 保持 WAL-before-mem 语义，避免内存数据已经可见但 WAL 尚未落盘。
 		if err = d.wal.AppendBatch(records); err == nil {
 			d.write.seq++
 
@@ -216,16 +193,7 @@ func (d *DB) applyWriteBatch(batch []*writeReq) {
 		}
 
 		if err == nil {
-			for _, req := range batch {
-				for _, op := range req.ops {
-					if op.op == writeOpDelete {
-						d.mem.Delete(op.key)
-					} else {
-						d.mem.Put(op.key, op.value)
-					}
-				}
-			}
-
+			applyBatchToMemtable(d.mem, batch)
 			if d.shouldAutoFlushLocked() {
 				d.requestAutoFlush()
 			}
@@ -273,7 +241,7 @@ func (d *DB) syncPendingWAL() error {
 		return nil
 	}
 
-	// 先截取当前待同步边界，再锁外执行 fsync，避免长时间阻塞前台路径。
+	// 先截取当前待同步边界，再锁外执行 fsync，避免长时间阻塞前台。
 	targetSeq := d.write.seq
 	d.mu.Unlock()
 
@@ -292,6 +260,55 @@ func (d *DB) syncPendingWAL() error {
 	}
 	d.mu.Unlock()
 	return nil
+}
+
+// cloneBatchOps 深拷贝一组写操作，避免调用方后续修改底层切片。
+func cloneBatchOps(ops []batchOp) []batchOp {
+	cloned := make([]batchOp, len(ops))
+	for i, op := range ops {
+		cloned[i] = batchOp{
+			op:    op.op,
+			key:   op.key,
+			value: cloneWriteValue(op.value),
+		}
+	}
+	return cloned
+}
+
+// buildWALRecords 把一轮 group commit 批次转换成 WAL 记录。
+func buildWALRecords(batch []*writeReq) []wal.Record {
+	totalOps := 0
+	for _, req := range batch {
+		totalOps += len(req.ops)
+	}
+
+	records := make([]wal.Record, 0, totalOps)
+	for _, req := range batch {
+		for _, op := range req.ops {
+			rec := wal.Record{
+				Key:   op.key,
+				Value: op.value,
+			}
+			if op.op == writeOpDelete {
+				rec.Op = 1
+			}
+			records = append(records, rec)
+		}
+	}
+	return records
+}
+
+// applyBatchToMemtable 把一轮 group commit 中的操作按原顺序写入 active memtable。
+func applyBatchToMemtable(mem *memtable.MemTable, batch []*writeReq) {
+	for _, req := range batch {
+		for _, op := range req.ops {
+			if op.op == writeOpDelete {
+				mem.Delete(op.key)
+			} else {
+				mem.Put(op.key, op.value)
+			}
+		}
+	}
 }
 
 // cloneWriteValue 复制写入值，避免调用方后续修改底层切片。

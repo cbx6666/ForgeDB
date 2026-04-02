@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 
 	"monolithdb/internal/manifest"
@@ -42,8 +43,6 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 	}
 
 	walPath := filepath.Join(dir, "forge.wal")
-	immWalPath := filepath.Join(dir, "forge.flush.wal")
-
 	w, err := wal.Open(walPath)
 	if err != nil {
 		_ = man.Close()
@@ -74,10 +73,18 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 		return nil
 	}
 
-	if err := replayInto(immWalPath, m); err != nil {
+	flushWALs, err := listFlushWALPaths(dir)
+	if err != nil {
 		_ = w.Close()
 		_ = man.Close()
 		return nil, err
+	}
+	for _, flushWALPath := range flushWALs {
+		if err := replayInto(flushWALPath, m); err != nil {
+			_ = w.Close()
+			_ = man.Close()
+			return nil, err
+		}
 	}
 	if err := replayInto(walPath, m); err != nil {
 		_ = w.Close()
@@ -132,7 +139,6 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 		man:        man,
 		dir:        dir,
 		walPath:    walPath,
-		immWalPath: immWalPath,
 		sstDir:     sstDir,
 		current:    newVersionFromLevels(levels),
 		opt:        opt,
@@ -182,6 +188,18 @@ func OpenWithOptions(dir string, opt Options) (*DB, error) {
 	}
 
 	return db, nil
+}
+
+// listFlushWALPaths 返回目录中所有需要在启动时回放的 flush WAL，按旧到新排序。
+func listFlushWALPaths(dir string) ([]string, error) {
+	pattern := filepath.Join(dir, "forge.flush.*.wal")
+
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(matches)
+	return matches, nil
 }
 
 // Close 停止后台协程并关闭底层资源。

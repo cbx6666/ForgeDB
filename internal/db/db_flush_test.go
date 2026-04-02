@@ -16,7 +16,7 @@ type flushSnapshot struct {
 	immNil  bool
 	memNil  bool
 	l0Count int
-	immWAL  string
+	headWAL string
 	wal     string
 }
 
@@ -28,10 +28,12 @@ func snapshotFlushStateLocked(d *DB) flushSnapshot {
 	levels := d.currentVersion().levels
 
 	s := flushSnapshot{
-		immNil: d.imm == nil,
+		immNil: len(d.imms) == 0,
 		memNil: d.mem == nil,
 		wal:    d.walPath,
-		immWAL: d.immWalPath,
+	}
+	if len(d.imms) > 0 && d.imms[0] != nil {
+		s.headWAL = d.imms[0].walPath
 	}
 	if len(levels) > 0 {
 		s.l0Count = len(levels[0].l0Paths)
@@ -45,10 +47,31 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
+// prepareFlushJobForTest 在锁内把当前 active memtable 冻结入队，并启动一份可执行的 flush job。
+func prepareFlushJobForTest(t *testing.T, d *DB) *flushJob {
+	t.Helper()
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	imm, err := d.enqueueActiveMemtableLocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imm == nil {
+		t.Fatal("enqueueActiveMemtableLocked returned nil immutable")
+	}
+	job := d.startFlushJobLocked()
+	if job == nil {
+		t.Fatal("startFlushJobLocked returned nil job")
+	}
+	return job
+}
+
 // ======== tests ========
 
-// 1) white-box: prepareFlushLocked 必须完成 mem -> imm 冻结与 WAL 轮换
-// TestDB_FlushPrepare_RotatesMemAndWAL 验证 prepare 会冻结 mem 并轮换 WAL。
+// 1) white-box: 冻结 active memtable 并启动队头 flush job 后，必须完成 immutable 入队与 WAL 轮换。
+// TestDB_FlushPrepare_RotatesMemAndWAL 验证冻结入队后会生成独立 flush job，并完成 WAL 轮换。
 func TestDB_FlushPrepare_RotatesMemAndWAL(t *testing.T) {
 	dir := t.TempDir()
 
@@ -63,36 +86,28 @@ func TestDB_FlushPrepare_RotatesMemAndWAL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// prepare（白盒调用）
-	d.mu.Lock()
-	job, err := d.prepareFlushLocked()
-	if err != nil {
-		d.mu.Unlock()
-		t.Fatal(err)
-	}
-	if job == nil {
-		d.mu.Unlock()
-		t.Fatal("prepareFlushLocked returned nil job")
-	}
+	// 白盒冻结当前 active memtable，并为队头启动一份可执行的 flush job。
+	job := prepareFlushJobForTest(t, d)
 
+	d.mu.Lock()
 	levels := d.currentVersion().levels
 
 	// 1) imm 必须非空
-	if d.imm == nil {
+	if len(d.imms) != 1 || d.imms[0] == nil || d.imms[0].mem == nil {
 		d.mu.Unlock()
-		t.Fatal("expected imm != nil after prepareFlushLocked")
+		t.Fatal("expected one immutable memtable after freezing active memtable")
 	}
 	// 2) old 必须在 imm 中
-	if e, ok := d.imm.GetAll("old"); !ok || e.Tombstone || string(e.Value) != "v-old" {
+	if e, ok := d.imms[0].mem.GetAll("old"); !ok || e.Tombstone || string(e.Value) != "v-old" {
 		d.mu.Unlock()
 		t.Fatalf("expected old in imm with value v-old, ok=%v tomb=%v", ok, ok && e.Tombstone)
 	}
 	// 3) old 不应该还在 active mem（因为已切换到新 mem）
 	if _, ok := d.mem.GetAll("old"); ok {
 		d.mu.Unlock()
-		t.Fatal("expected old NOT in active mem after prepareFlushLocked")
+		t.Fatal("expected old NOT in active mem after freezing active memtable")
 	}
-	// 4) prepare 后 L0 还没安装新表
+	// 4) immutable 入队并生成 flush job 后，L0 还没安装新表。
 	if len(levels) == 0 || len(levels[0].l0Paths) != 0 {
 		got := 0
 		if len(levels) > 0 {
@@ -101,15 +116,15 @@ func TestDB_FlushPrepare_RotatesMemAndWAL(t *testing.T) {
 		d.mu.Unlock()
 		t.Fatalf("expected L0 unchanged before install, got L0=%d", got)
 	}
-	immWal := d.immWalPath
+	immWal := d.imms[0].walPath
 	activeWal := d.walPath
 	d.mu.Unlock()
 
-	// 5) WAL 文件应已经轮换：forge.flush.wal 应存在
+	// 5) WAL 文件应已经轮换：本轮独立的 flush WAL 应存在。
 	if !fileExists(immWal) {
 		t.Fatalf("expected flush wal exists after prepare: %s", immWal)
 	}
-	// 6) active wal 也应该存在（新打开）
+	// 6) active wal 也应该存在（已为后续写入重新打开）。
 	if !fileExists(activeWal) {
 		t.Fatalf("expected active wal exists after prepare: %s", activeWal)
 	}
@@ -151,19 +166,9 @@ func TestDB_Flush_ForegroundWritesDuringFlushAndInstallCleansUp(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// prepare
-	d.mu.Lock()
-	job, err := d.prepareFlushLocked()
-	if err != nil {
-		d.mu.Unlock()
-		t.Fatal(err)
-	}
-	if job == nil {
-		d.mu.Unlock()
-		t.Fatal("prepareFlushLocked returned nil job")
-	}
-	flushWal := d.immWalPath
-	d.mu.Unlock()
+	// 白盒冻结当前 active memtable，并启动一份可执行的 flush job。
+	job := prepareFlushJobForTest(t, d)
+	flushWal := job.imm.walPath
 
 	// flush 中继续写新数据
 	if err := d.Put("new", []byte("v-new")); err != nil {
@@ -200,7 +205,7 @@ func TestDB_Flush_ForegroundWritesDuringFlushAndInstallCleansUp(t *testing.T) {
 		l0Before = len(levelsBefore[0].l0Paths)
 	}
 	err = d.installFlushLocked()
-	immNil := (d.imm == nil)
+	immNil := (len(d.imms) == 0)
 	levelsAfter := d.currentVersion().levels
 	l0After := 0
 	if len(levelsAfter) > 0 {
@@ -240,8 +245,8 @@ func TestDB_Flush_ForegroundWritesDuringFlushAndInstallCleansUp(t *testing.T) {
 	}
 }
 
-// 3) white-box crash simulation: prepare 后不 do/install，重启必须从 forge.flush.wal + forge.wal 恢复
-// TestDB_Reopen_RecoversFlushWALAndActiveWAL 验证中间态下重启能从两份 WAL 恢复。
+// 3) white-box crash simulation: immutable 已入队但尚未 do/install，重启必须从 flush WAL 队列与 forge.wal 恢复。
+// TestDB_Reopen_RecoversFlushWALAndActiveWAL 验证中间态下重启能从两类 WAL 恢复。
 func TestDB_Reopen_RecoversFlushWALAndActiveWAL(t *testing.T) {
 	dir := t.TempDir()
 
@@ -260,20 +265,10 @@ func TestDB_Reopen_RecoversFlushWALAndActiveWAL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// prepare 成功，但不 do/install（模拟崩溃前中间态）
+	// immutable 已入队并生成 flush job，但不 do/install（模拟崩溃前中间态）。
+	job := prepareFlushJobForTest(t, d)
 	d.mu.Lock()
-	job, err := d.prepareFlushLocked()
-	if err != nil {
-		d.mu.Unlock()
-		_ = d.Close()
-		t.Fatal(err)
-	}
-	if job == nil {
-		d.mu.Unlock()
-		_ = d.Close()
-		t.Fatal("prepareFlushLocked returned nil job")
-	}
-	flushWal := d.immWalPath
+	flushWal := job.imm.walPath
 	activeWal := d.walPath
 	d.mu.Unlock()
 
@@ -288,13 +283,13 @@ func TestDB_Reopen_RecoversFlushWALAndActiveWAL(t *testing.T) {
 		t.Fatalf("expected active wal exists before crash: %s", activeWal)
 	}
 
-	// prepare 后写新数据（进入新 active wal）
+	// 入队后继续写新数据（进入新 active wal）。
 	if err := d.Put("new1", []byte("vn1")); err != nil {
 		_ = d.Close()
 		t.Fatal(err)
 	}
 
-	// 模拟崩溃：直接关闭（此时 flush wal 仍保留）
+	// 模拟崩溃：直接关闭（此时队头 flush wal 仍保留）。
 	if err := d.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -348,17 +343,7 @@ func TestDB_Reopen_RecoversWhenFlushSSTExistsButInstallNotDone(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	d.mu.Lock()
-	job, err := d.prepareFlushLocked()
-	d.mu.Unlock()
-	if err != nil {
-		_ = d.Close()
-		t.Fatal(err)
-	}
-	if job == nil {
-		_ = d.Close()
-		t.Fatal("prepareFlushLocked returned nil job")
-	}
+	job := prepareFlushJobForTest(t, d)
 
 	if err := d.Put("new", []byte("v-new")); err != nil {
 		_ = d.Close()
@@ -436,8 +421,8 @@ func TestDB_MultipleFlushes_NoImmLeakAndReadsCorrect(t *testing.T) {
 			t.Fatalf("expected L0 count=%d after flush #%d, got %d", i+1, i, s.l0Count)
 		}
 		// flush wal 应该不存在（install 会删）
-		if fileExists(s.immWAL) {
-			t.Fatalf("expected flush wal removed after flush #%d: %s", i, s.immWAL)
+		if s.headWAL != "" && fileExists(s.headWAL) {
+			t.Fatalf("expected head flush wal removed after flush #%d: %s", i, s.headWAL)
 		}
 	}
 
@@ -450,6 +435,96 @@ func TestDB_MultipleFlushes_NoImmLeakAndReadsCorrect(t *testing.T) {
 		if !ok || string(got) != vals[i] {
 			t.Fatalf("want %s=%q, ok=%v got=%q", keys[i], vals[i], ok, string(got))
 		}
+	}
+}
+
+// 4.1) white-box: 第一份 immutable memtable 尚未 install 时，第二份也应允许入队，并在 install 后成为新的队头。
+// TestDB_FlushQueue_SecondImmutableBecomesNewHead 验证单 worker + immutable queue 的基本排队语义。
+func TestDB_FlushQueue_SecondImmutableBecomesNewHead(t *testing.T) {
+	dir := t.TempDir()
+
+	d, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+
+	if err := d.Put("k1", []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+
+	// 先准备第一份 flush job，但暂不 install，模拟“队头仍在途”的状态。
+	job1 := prepareFlushJobForTest(t, d)
+
+	if err := d.Put("k2", []byte("v2")); err != nil {
+		t.Fatal(err)
+	}
+
+	// 第一份 immutable 尚未 install 时，再把新的 active mem 冻结入队。
+	d.mu.Lock()
+	imm2, err := d.enqueueActiveMemtableLocked()
+	if err != nil {
+		d.mu.Unlock()
+		t.Fatal(err)
+	}
+	if imm2 == nil {
+		d.mu.Unlock()
+		t.Fatal("enqueueActiveMemtableLocked returned nil immutable")
+	}
+	if got := len(d.imms); got != 2 {
+		d.mu.Unlock()
+		t.Fatalf("expected 2 immutable memtables queued, got %d", got)
+	}
+	if d.imms[0].walPath != job1.imm.walPath {
+		d.mu.Unlock()
+		t.Fatal("expected queue head still points to the first immutable wal")
+	}
+	d.mu.Unlock()
+
+	if err := d.doFlush(job1); err != nil {
+		t.Fatal(err)
+	}
+
+	// 安装第一份 SST 后，第二份 immutable 应自动成为新的队头。
+	d.mu.Lock()
+	err = d.installFlushLocked()
+	if err != nil {
+		d.mu.Unlock()
+		t.Fatal(err)
+	}
+	if got := len(d.imms); got != 1 {
+		d.mu.Unlock()
+		t.Fatalf("expected 1 immutable memtable remaining after first install, got %d", got)
+	}
+	if d.imms[0] != imm2 {
+		d.mu.Unlock()
+		t.Fatal("expected second immutable memtable promoted to queue head")
+	}
+	if d.imms[0].walPath != imm2.walPath {
+		d.mu.Unlock()
+		t.Fatal("expected queue head updated to the second immutable wal")
+	}
+	d.mu.Unlock()
+
+	got1, ok1, err := d.Get("k1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok1 || string(got1) != "v1" {
+		t.Fatalf("want k1=v1 after first install, ok=%v got=%q", ok1, string(got1))
+	}
+
+	got2, ok2, err := d.Get("k2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok2 || string(got2) != "v2" {
+		t.Fatalf("want k2=v2 while second immutable is queued, ok=%v got=%q", ok2, string(got2))
+	}
+
+	// 最后走公开 Flush，把第二份队列数据也完全落盘，避免残留影响后续状态。
+	if err := d.Flush(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -469,15 +544,7 @@ func TestDB_Flush_FileLayout_NoTmpLeft(t *testing.T) {
 	}
 
 	// prepare
-	d.mu.Lock()
-	job, err := d.prepareFlushLocked()
-	d.mu.Unlock()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if job == nil {
-		t.Fatal("prepareFlushLocked returned nil job")
-	}
+	job := prepareFlushJobForTest(t, d)
 
 	// do
 	if err := d.doFlush(job); err != nil {
@@ -536,15 +603,7 @@ func TestDB_Flush_AdoptsPreparedJob(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	d.mu.Lock()
-	job, err := d.prepareFlushLocked()
-	d.mu.Unlock()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if job == nil {
-		t.Fatal("prepareFlushLocked returned nil job")
-	}
+	prepareFlushJobForTest(t, d)
 
 	done := make(chan error, 1)
 	go func() {
