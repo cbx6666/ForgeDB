@@ -177,35 +177,14 @@ func (d *DB) applyWriteBatch(batch []*writeReq) {
 
 	err := d.checkBGErrLocked()
 	if err == nil {
-		records := buildWALRecords(batch)
-
-		// 先批量写 WAL，再按策略 fsync，最后按原顺序写入 memtable。
-		// 保持 WAL-before-mem 语义，避免内存数据已经可见但 WAL 尚未落盘。
-		if err = d.wal.AppendBatch(records); err == nil {
-			d.write.seq++
-
-			if d.opt.walSync == WALSyncEveryBatch {
-				err = d.write.syncWAL()
-				if err == nil {
-					d.write.syncedSeq = d.write.seq
-				}
-			}
-		}
+		// 1) 先把这一轮 group commit 追加到 WAL，并按配置决定是否立即 fsync。
+		err = d.appendWriteBatchWALLocked(batch)
 
 		if err == nil {
+			// 2) WAL 成功后，按原顺序把写入应用到 active memtable。
 			applyBatchToMemtable(d.mem, batch)
-			if d.shouldAutoFlushLocked() {
-				d.requestAutoFlush()
-				for d.bgErr == nil && !d.closing && d.shouldAutoFlushLocked() && d.flushQueueFullLocked() {
-					// immutable queue 已满且 active mem 继续超过阈值时，写入方要等待后台 flush 腾出空位，
-					// 否则 active mem 会持续膨胀，背压就失效了。
-					d.requestFlushLocked()
-					d.flush.cond.Wait()
-				}
-				if d.bgErr != nil {
-					err = d.bgErr
-				}
-			}
+			// 3) 如果 active mem 超过自动 flush 阈值，则请求后台 flush，并在队列满时施加背压。
+			err = d.waitWriteFlushBackpressureLocked()
 		} else {
 			d.bgErr = err
 		}
@@ -216,6 +195,49 @@ func (d *DB) applyWriteBatch(batch []*writeReq) {
 	for _, req := range batch {
 		req.done <- err
 	}
+}
+
+// appendWriteBatchWALLocked 先把一轮 group commit 写入 WAL，再按策略决定是否立即 fsync。
+func (d *DB) appendWriteBatchWALLocked(batch []*writeReq) error {
+	records := buildWALRecords(batch)
+
+	// 保持 WAL-before-mem 语义，避免内存数据已经可见但 WAL 尚未落盘。
+	if err := d.wal.AppendBatch(records); err != nil {
+		return err
+	}
+
+	d.write.seq++
+
+	if d.opt.walSync != WALSyncEveryBatch {
+		return nil
+	}
+
+	if err := d.write.syncWAL(); err != nil {
+		return err
+	}
+	d.write.syncedSeq = d.write.seq
+	return nil
+}
+
+// waitWriteFlushBackpressureLocked 在写入触发自动 flush 后处理队列背压。
+func (d *DB) waitWriteFlushBackpressureLocked() error {
+	if !d.shouldAutoFlushLocked() {
+		return nil
+	}
+
+	d.requestAutoFlush()
+
+	for d.bgErr == nil && !d.closing && d.shouldAutoFlushLocked() && d.flushQueueFullLocked() {
+		// immutable queue 已满且 active mem 继续超过阈值时，写入方要等待后台 flush 腾出空位，
+		// 否则 active mem 会持续膨胀，背压就失效了。
+		d.requestFlushLocked()
+		d.flush.cond.Wait()
+	}
+
+	if d.bgErr != nil {
+		return d.bgErr
+	}
+	return nil
 }
 
 // walSyncLoop 按固定间隔同步 WAL。
