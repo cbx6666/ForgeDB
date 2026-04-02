@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"monolithdb/internal/manifest"
+	"monolithdb/internal/types"
 )
 
 // db_compaction_test.go 验证 compaction 的选取、安装和层级约束。
@@ -141,8 +144,316 @@ func TestDB_PickCompactionLevel_PrefersMostOverloadedLevel(t *testing.T) {
 	}
 }
 
+// TestDB_PickCompactionJob_SkipsWhenDstOverlapPending 验证目标层重叠文件已被 pending 占用时，本轮任务会放弃。
+func TestDB_PickCompactionJob_SkipsWhenDstOverlapPending(t *testing.T) {
+	dir := t.TempDir()
+
+	d, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+
+	if err := d.Put("m", []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Put("n", []byte("2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	l1Run, _, err := d.writeSingleRun(1, []types.Entry{
+		{Key: "k", Value: []byte("x")},
+		{Key: "z", Value: []byte("y")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d.mu.Lock()
+	v := d.currentVersion().withLevels()
+	if len(v.levels[0].l0Paths) != 2 {
+		t.Fatalf("expected 2 L0 files, got %d", len(v.levels[0].l0Paths))
+	}
+	v.levels[1].runs = []levelFile{l1Run}
+	d.current = v
+	d.compaction.pendingPaths[l1Run.path] = struct{}{}
+
+	job, err := d.pickCompactionJobLocked(0)
+	d.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job != nil {
+		t.Fatalf("expected nil job when dst overlap is pending, got %+v", job)
+	}
+}
+
+// TestDB_PickCompactionJob_L0InputOrderStable 验证 L0 选择输入时顺序稳定，并保持“所选文件里较新的在前”。
+func TestDB_PickCompactionJob_L0InputOrderStable(t *testing.T) {
+	dir := t.TempDir()
+
+	opt := defaultOptions()
+	opt.levels[0].pickN = 2
+
+	d, err := OpenWithOptions(dir, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+
+	if err := d.Put("a", []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Put("b", []byte("2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Put("c", []byte("3")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	d.mu.Lock()
+	v := d.currentVersion().withLevels()
+	if len(v.levels[0].l0Paths) != 3 {
+		t.Fatalf("expected 3 L0 files, got %d", len(v.levels[0].l0Paths))
+	}
+	d.current = v
+
+	job, err := d.pickCompactionJobLocked(0)
+	d.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job == nil {
+		t.Fatal("expected non-nil compaction job")
+	}
+
+	want := []string{v.levels[0].l0Paths[1], v.levels[0].l0Paths[2]}
+	if len(job.srcPaths) != len(want) {
+		t.Fatalf("expected %d source paths, got %d", len(want), len(job.srcPaths))
+	}
+	for i, path := range want {
+		if job.srcPaths[i] != path {
+			t.Fatalf("expected srcPaths[%d]=%s, got %s", i, path, job.srcPaths[i])
+		}
+	}
+}
+
+// TestDB_PickCompactionJob_SkipsWhenAllSourceInputsPending 验证源层候选文件全部 pending 时不会再生成任务。
+func TestDB_PickCompactionJob_SkipsWhenAllSourceInputsPending(t *testing.T) {
+	dir := t.TempDir()
+
+	opt := defaultOptions()
+	opt.levels[0].pickN = 2
+
+	d, err := OpenWithOptions(dir, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+
+	if err := d.Put("a", []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Put("b", []byte("2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	d.mu.Lock()
+	v := d.currentVersion()
+	if len(v.levels[0].l0Paths) != 2 {
+		d.mu.Unlock()
+		t.Fatalf("expected 2 L0 files, got %d", len(v.levels[0].l0Paths))
+	}
+	for _, p := range v.levels[0].l0Paths {
+		d.compaction.pendingPaths[p] = struct{}{}
+	}
+	job, err := d.pickCompactionJobLocked(0)
+	d.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job != nil {
+		t.Fatalf("expected nil job when all source inputs are pending, got %+v", job)
+	}
+}
+
+// TestDB_RunCompactionStep_NoWorkReturnsFalse 验证单步 compaction 在没有超阈值层时直接返回 false。
+func TestDB_RunCompactionStep_NoWorkReturnsFalse(t *testing.T) {
+	dir := t.TempDir()
+
+	opt := defaultOptions()
+	opt.numLevels = 2
+	opt.levels = []LevelOptions{
+		{maxFiles: 2, pickN: 2, runMaxEntries: 0},
+		{maxFiles: 0, pickN: 0, runMaxEntries: 64},
+	}
+
+	d, err := OpenWithOptions(dir, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+
+	if err := d.Put("a", []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	if d.runCompactionStep() {
+		t.Fatal("expected compaction step to return false when no level is overloaded")
+	}
+	if err := d.checkBGErrLocked(); err != nil {
+		t.Fatalf("expected no background error, got %v", err)
+	}
+}
+
+// TestDB_RunCompactionStep_CompletesAndClearsPending 验证单步 compaction 会完成一轮安装并清理 pending。
+func TestDB_RunCompactionStep_CompletesAndClearsPending(t *testing.T) {
+	dir := t.TempDir()
+
+	opt := defaultOptions()
+	opt.numLevels = 2
+	opt.levels = []LevelOptions{
+		{maxFiles: 100, pickN: 2, runMaxEntries: 0},
+		{maxFiles: 0, pickN: 0, runMaxEntries: 64},
+	}
+
+	d, err := OpenWithOptions(dir, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+
+	if err := d.Put("a", []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Put("b", []byte("2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	d.mu.Lock()
+	d.opt.levels[0].maxFiles = 1
+	d.mu.Unlock()
+
+	if !d.runCompactionStep() {
+		t.Fatal("expected compaction step to complete one L0->L1 job")
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if len(d.compaction.pendingPaths) != 0 {
+		t.Fatalf("expected pending paths to be cleared, got %d", len(d.compaction.pendingPaths))
+	}
+
+	v := d.currentVersion()
+	if got := len(v.levels[0].l0Paths); got != 0 {
+		t.Fatalf("expected L0 to be empty after compaction, got %d files", got)
+	}
+	if got := len(v.levels[1].runs); got == 0 {
+		t.Fatal("expected L1 to contain compaction output")
+	}
+}
+
+// TestDB_InstallCompactionFailure_ClearsPendingAndSetsBGErr 验证安装失败时会回收 pending 并记录后台错误。
+func TestDB_InstallCompactionFailure_ClearsPendingAndSetsBGErr(t *testing.T) {
+	dir := t.TempDir()
+
+	opt := defaultOptions()
+	opt.numLevels = 2
+	opt.levels = []LevelOptions{
+		{maxFiles: 100, pickN: 2, runMaxEntries: 0},
+		{maxFiles: 0, pickN: 0, runMaxEntries: 64},
+	}
+
+	d, err := OpenWithOptions(dir, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+
+	if err := d.Put("a", []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Put("b", []byte("2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	d.mu.Lock()
+	d.opt.levels[0].maxFiles = 1
+	job, err := d.pickCompactionJobLocked(0)
+	d.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job == nil {
+		t.Fatal("expected compaction job before forcing install failure")
+	}
+
+	newRuns, err := d.doCompaction(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := d.man.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d.mu.Lock()
+	d.man = &manifest.Manifest{}
+	err = d.installCompactionLocked(job, newRuns)
+	if err == nil {
+		d.mu.Unlock()
+		t.Fatal("expected installCompactionLocked to fail when manifest write is unavailable")
+	}
+	d.failCompactionLocked(job, err)
+	if d.bgErr == nil {
+		d.mu.Unlock()
+		t.Fatal("expected background error after install failure")
+	}
+	if len(d.compaction.pendingPaths) != 0 {
+		d.mu.Unlock()
+		t.Fatalf("expected pending paths to be cleared after install failure, got %d", len(d.compaction.pendingPaths))
+	}
+	d.mu.Unlock()
+}
+
 // mustBuildManualL0Compaction 手工构造一轮 L0 compaction 及其结果。
-func mustBuildManualL0Compaction(t *testing.T, d *DB) (*compactionJob, *compactionResult) {
+func mustBuildManualL0Compaction(t *testing.T, d *DB) (*compactionJob, []levelFile) {
 	t.Helper()
 
 	d.mu.Lock()
@@ -155,26 +466,24 @@ func mustBuildManualL0Compaction(t *testing.T, d *DB) (*compactionJob, *compacti
 		t.Fatal("expected manual L0 compaction job")
 	}
 
-	res, err := d.doCompaction(job)
+	newRuns, err := d.doCompaction(job)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res == nil || len(res.newRuns) == 0 {
+	if len(newRuns) == 0 {
 		t.Fatal("expected compaction outputs")
 	}
-	for _, run := range res.newRuns {
+	for _, run := range newRuns {
 		if !fileExists(run.path) {
 			t.Fatalf("expected compaction output exists: %s", run.path)
 		}
 	}
-	return job, res
+	return job, newRuns
 }
 
 // installCompactionVersionWithoutCleanup 安装 compaction 版本但暂不清理旧文件。
-func installCompactionVersionWithoutCleanup(t *testing.T, d *DB, res *compactionResult) []string {
+func installCompactionVersionWithoutCleanup(t *testing.T, d *DB, job *compactionJob, newRuns []levelFile) []string {
 	t.Helper()
-
-	job := res.job
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -191,25 +500,9 @@ func installCompactionVersionWithoutCleanup(t *testing.T, d *DB, res *compaction
 		src.runs = removeRunsByPaths(src.runs, job.srcPaths)
 	}
 
-	overIdx := overlappedRuns(dst.runs, job.minKey, job.maxKey)
-	realOldDst := make([]string, 0, len(overIdx))
-	for _, i := range overIdx {
-		realOldDst = append(realOldDst, dst.runs[i].path)
-	}
-
-	newDst := make([]levelFile, 0, len(dst.runs)-len(overIdx)+len(res.newRuns))
-	if len(overIdx) == 0 {
-		newDst = append(newDst, dst.runs...)
-		newDst = append(newDst, res.newRuns...)
-		assertRunsSortedNoOverlap(t, newDst)
-	} else {
-		start := overIdx[0]
-		end := overIdx[len(overIdx)-1] + 1
-		newDst = append(newDst, dst.runs[:start]...)
-		newDst = append(newDst, res.newRuns...)
-		newDst = append(newDst, dst.runs[end:]...)
-	}
-	dst.runs = newDst
+	overIdx, realOldDst := compactionInstallOverlap(dst.runs, job.minKey, job.maxKey)
+	dst.runs = replaceCompactionDstRuns(dst.runs, overIdx, newRuns)
+	assertRunsSortedNoOverlap(t, dst.runs)
 
 	if err := d.persistManifestLevels(newv.levels); err != nil {
 		t.Fatal(err)
@@ -220,10 +513,7 @@ func installCompactionVersionWithoutCleanup(t *testing.T, d *DB, res *compaction
 	oldPaths = append(oldPaths, job.srcPaths...)
 	oldPaths = append(oldPaths, realOldDst...)
 
-	all := make([]string, 0, len(job.srcPaths)+len(job.dstPaths))
-	all = append(all, job.srcPaths...)
-	all = append(all, job.dstPaths...)
-	d.clearPendingLocked(all)
+	d.clearPendingLocked(job.allPaths())
 
 	return oldPaths
 }
@@ -712,9 +1002,9 @@ func TestDB_Reopen_RemovesOrphanCompactionOutputsBeforeInstall(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, res := mustBuildManualL0Compaction(t, d)
-	newPaths := make([]string, 0, len(res.newRuns))
-	for _, run := range res.newRuns {
+	_, newRuns := mustBuildManualL0Compaction(t, d)
+	newPaths := make([]string, 0, len(newRuns))
+	for _, run := range newRuns {
 		newPaths = append(newPaths, run.path)
 	}
 
@@ -784,8 +1074,8 @@ func TestDB_Reopen_CleansOldCompactionInputsAfterManifestInstalled(t *testing.T)
 		t.Fatal(err)
 	}
 
-	_, res := mustBuildManualL0Compaction(t, d)
-	oldPaths := installCompactionVersionWithoutCleanup(t, d, res)
+	job, newRuns := mustBuildManualL0Compaction(t, d)
+	oldPaths := installCompactionVersionWithoutCleanup(t, d, job, newRuns)
 	for _, p := range oldPaths {
 		if !fileExists(p) {
 			_ = d.Close()
@@ -793,8 +1083,8 @@ func TestDB_Reopen_CleansOldCompactionInputsAfterManifestInstalled(t *testing.T)
 		}
 	}
 
-	newPaths := make([]string, 0, len(res.newRuns))
-	for _, run := range res.newRuns {
+	newPaths := make([]string, 0, len(newRuns))
+	for _, run := range newRuns {
 		newPaths = append(newPaths, run.path)
 	}
 

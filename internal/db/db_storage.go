@@ -609,39 +609,3 @@ func (d *DB) writeSingleRun(dstLevel int, entries []types.Entry) (levelFile, str
 		maxKey: entries[len(entries)-1].Key,
 	}, finalPath, nil
 }
-
-// writeRuns 把一批有序记录按 runMaxEntries 切分并写成多个 run。
-func (d *DB) writeRuns(dstLevel int, merged []types.Entry) ([]levelFile, []string, error) {
-	if len(merged) == 0 {
-		return nil, nil, nil
-	}
-
-	runMax := d.opt.levels[dstLevel].runMaxEntries
-	if runMax <= 0 {
-		return nil, nil, fmt.Errorf("db: invalid runMaxEntries for level %d", dstLevel)
-	}
-	newRuns := make([]levelFile, 0, (len(merged)+runMax-1)/runMax)
-	created := make([]string, 0, cap(newRuns))
-
-	for i := 0; i < len(merged); {
-		j := i + runMax
-		if j > len(merged) {
-			j = len(merged)
-		}
-		chunk := merged[i:j]
-
-		run, path, err := d.writeSingleRun(dstLevel, chunk)
-		if err != nil {
-			for _, p := range created {
-				_ = os.Remove(p)
-			}
-			return nil, nil, err
-		}
-
-		created = append(created, path)
-		newRuns = append(newRuns, run)
-		i = j
-	}
-
-	return newRuns, created, nil
-}
